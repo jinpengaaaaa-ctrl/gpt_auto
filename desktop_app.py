@@ -69,7 +69,8 @@ class ApiClient:
 
 class DashboardApp(tk.Tk):
     NAV = (("概览", "overview"), ("开始运行", "run"), ("资源管理", "resources"),
-           ("已创建账户", "accounts"), ("运行记录", "history"), ("配置中心", "settings"))
+           ("已创建账户", "accounts"), ("运行记录", "history"), ("结果文件", "results"),
+           ("配置中心", "settings"))
 
     def __init__(self) -> None:
         super().__init__()
@@ -492,6 +493,56 @@ class DashboardApp(tk.Tk):
 
     def _render_accounts(self, frame: tk.Frame) -> None: self._render_table(frame, "已创建账户", "/api/registered-accounts", ("email", "status", "offer_status", "browser_backend", "updated_at"))
     def _render_history(self, frame: tk.Frame) -> None: self._render_table(frame, "运行记录", "/api/history", ("session_id", "stage", "status", "last_error", "updated_at"))
+
+    def _render_results(self, frame: tk.Frame) -> None:
+        card = self._card(frame, "结果文件（results.txt）")
+        card.pack(fill="both", expand=True)
+        state: dict[str, str] = {"version": ""}
+        toolbar = tk.Frame(card, bg="white")
+        toolbar.pack(fill="x", padx=18, pady=(12, 6))
+        meta = tk.Label(toolbar, text="正在读取结果文件…", bg="white", fg="#737a70")
+        meta.pack(side="left")
+        editor = tk.Text(card, wrap="none", undo=True, font=("Consolas", 10), height=20)
+        editor.pack(fill="both", expand=True, padx=18, pady=8)
+        tk.Label(
+            card,
+            text="结果文件可能包含账户凭据，只在本机查看和保存；保存采用版本校验，避免覆盖其他流程的更新。",
+            bg="#fff4df",
+            fg="#865b19",
+            wraplength=850,
+            justify="left",
+            padx=10,
+            pady=8,
+        ).pack(fill="x", padx=18, pady=(0, 8))
+
+        def populate(data: dict) -> None:
+            if not editor.winfo_exists():
+                return
+            editor.delete("1.0", "end")
+            editor.insert("1.0", str(data.get("raw_text", "")))
+            state["version"] = str(data.get("version", ""))
+            meta.configure(text=f"{data.get('name', 'results.txt')} · {data.get('size', 0)} bytes · 版本已读取")
+
+        def load() -> dict:
+            return self.api.request("/api/results/file")
+
+        def reload_results() -> None:
+            self._async(load, populate)
+
+        def save_results() -> None:
+            if not state["version"]:
+                messagebox.showwarning("尚未读取", "请先读取结果文件后再保存。", parent=self)
+                return
+            body = {"expected_version": state["version"], "raw_text": editor.get("1.0", "end-1c")}
+            self._async(
+                lambda: self.api.request("/api/results/file", "PUT", body),
+                lambda data: (populate(data), messagebox.showinfo("已保存", "结果文件已安全保存。", parent=self)),
+            )
+
+        self._button(toolbar, "重新读取", reload_results).pack(side="right")
+        self._button(toolbar, "保存结果", save_results, True).pack(side="right", padx=8)
+        self._async(load, populate)
+
     def _render_table(self, frame: tk.Frame, title: str, endpoint: str, columns: tuple[str, ...]) -> None:
         card=self._card(frame,title);card.pack(fill="both",expand=True); tree=ttk.Treeview(card,columns=columns,show="headings");
         for col in columns: tree.heading(col,text=col);tree.column(col,width=170)
