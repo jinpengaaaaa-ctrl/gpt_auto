@@ -5,12 +5,18 @@ import os
 # ==========================================
 try:
     from dotenv import load_dotenv
-    _ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    _ENV_FILE = os.path.join(
+        os.environ.get("GPT_AUTOMATION_DATA_DIR", os.path.dirname(os.path.abspath(__file__))),
+        ".env",
+    )
     if os.path.isfile(_ENV_FILE):
         load_dotenv(_ENV_FILE, override=False)
 except ImportError:
     # Fallback: manual .env parsing if python-dotenv is not installed
-    _ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    _ENV_FILE = os.path.join(
+        os.environ.get("GPT_AUTOMATION_DATA_DIR", os.path.dirname(os.path.abspath(__file__))),
+        ".env",
+    )
     if os.path.isfile(_ENV_FILE):
         with open(_ENV_FILE, "r", encoding="utf-8") as _f:
             for _line in _f:
@@ -33,7 +39,9 @@ except ImportError:
 # ==========================================
 # 0.1 Base Directory
 # ==========================================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.abspath(
+    os.environ.get("GPT_AUTOMATION_DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+)
 
 # ==========================================
 # 1. 路径管理

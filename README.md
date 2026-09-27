@@ -139,6 +139,26 @@ python -m gpt_automation.web --port 8765
 - 资源管理可以新增／编辑可用邮箱与信用卡；占用中、已使用、隔离资源保持只读；卡号、CVC、邮箱密码与 token 不会回显。
 - 真实账户流程请继续使用原有 `start.bat` 或 CLI 入口。
 
+## Windows 桌面版
+
+GitHub Releases 会提供 `GPTAutomation-Setup-<version>.exe` 安装包。安装后，
+桌面控制台可以完成任务参数、IP／浏览器策略、邮箱与卡片资源、READY 账户、
+运行记录和人工接管操作；真实任务仍由同一个 `RegistrationWorkflow` 执行。
+
+首次启动会在当前用户的 `%LOCALAPPDATA%\GPTAutomation` 创建数据目录和 `.env`，
+敏感输入只保存在本机。开发者发布新的 `v*` 标签后，GitHub Actions 自动构建
+安装包并创建 Release；客户端启动时检查最新 Release，发现新版本会提示下载并
+运行安装包完成更新。
+
+本地构建 Windows 安装包：
+
+```powershell
+.\packaging\build_windows.ps1
+```
+
+脚本需要 Python 3.12、Inno Setup 和项目依赖；没有 Inno Setup 时仍会生成
+`dist/GPTAutomation/` 的可运行目录。
+
 ## 核心结构
 
 ```text

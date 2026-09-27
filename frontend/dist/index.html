@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>GPT Automation 控制台</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand"><div class="brand-mark">G</div><div><strong>GPT Automation</strong><small>桌面控制台</small></div></div>
+      <nav id="nav">
+        <button class="nav-item active" data-view="overview">概览</button>
+        <button class="nav-item" data-view="run">开始运行</button>
+        <button class="nav-item" data-view="resources">资源管理</button>
+        <button class="nav-item" data-view="accounts">已创建账户</button>
+        <button class="nav-item" data-view="history">运行记录</button>
+        <button class="nav-item" data-view="settings">配置中心</button>
+      </nav>
+      <div class="sidebar-foot"><span class="dot"></span><span id="healthText">正在连接本机服务…</span></div>
+    </aside>
+    <main class="main">
+      <header class="topbar"><div><span class="eyebrow">LOCAL WORKSPACE</span><h1 id="pageTitle">概览</h1></div><div class="top-actions"><span id="updateBadge" class="badge hidden"></span><button class="ghost" id="refreshBtn">刷新</button></div></header>
+      <div id="toast" class="toast hidden"></div>
+      <section id="view-overview" class="view active"></section>
+      <section id="view-run" class="view"></section>
+      <section id="view-resources" class="view"></section>
+      <section id="view-accounts" class="view"></section>
+      <section id="view-history" class="view"></section>
+      <section id="view-settings" class="view"></section>
+    </main>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>

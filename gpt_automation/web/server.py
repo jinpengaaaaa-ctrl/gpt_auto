@@ -14,6 +14,7 @@ import os
 import threading
 import time
 import uuid
+import importlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -74,6 +75,10 @@ class DashboardServer:
     ) -> None:
         self.project_root = Path(project_root)
         self.resources = ResourceAdminService(input_dir=input_dir, db_path=db_path)
+        # Initialize the canonical schema on a fresh installation before
+        # read-only account/history endpoints access it.
+        self.state_store = StateStore(db_path)
+        self.state_store.initialize()
         runtime_dir = Path(db_path).parent
         self.resource_states = ResourceStateCorrectionService(
             self.resources,
@@ -83,11 +88,14 @@ class DashboardServer:
         )
         self.history = HistoryQueryService(db_path=db_path)
         self.accounts = RegisteredAccountService(
-            state_store=StateStore(db_path),
+            state_store=self.state_store,
             credential_store=CredentialStore(Path(db_path).parent / "credentials"),
             output_dir=Path(db_path).parent / "exports",
         )
-        self.results = ResultFileService(self.project_root / config.OUTPUT_CSV)
+        result_path = Path(config.OUTPUT_CSV)
+        if not result_path.is_absolute():
+            result_path = Path(config.BASE_DIR) / result_path
+        self.results = ResultFileService(result_path)
         self.demo = DemoRunEngine(snapshot_path=snapshot_path)
         self.production = ProductionRunEngine(
             db_path=db_path,
@@ -259,8 +267,32 @@ class DashboardServer:
         enriched = []
         for view in views:
             actions = self.resource_states.allowed_actions_for_view(view)
-            enriched.append(dataclasses.replace(view, state_actions=actions))
+            enriched.append(
+                self._redact_resource_view(
+                    dataclasses.replace(view, state_actions=actions)
+                )
+            )
         return {"items": _to_dict(enriched)}
+
+    @staticmethod
+    def _redact_resource_view(view):
+        """Keep secrets out of the desktop/browser resource listing API."""
+        detail = dict(view.detail or {})
+        if view.resource_type == "card":
+            card_no = str(detail.get("card_no", ""))
+            masked = f"•••• {card_no[-4:]}" if len(card_no) >= 4 else "••••"
+            detail = {
+                "last4": card_no[-4:] if len(card_no) >= 4 else "",
+                "expiry": detail.get("expiry", ""),
+                "holder": detail.get("holder", ""),
+            }
+            return dataclasses.replace(view, display=masked, detail=detail)
+        if view.resource_type == "email":
+            return dataclasses.replace(
+                view,
+                detail={"email": detail.get("email", "")},
+            )
+        return view
 
     def get_resource_summary(self, resource_type: str) -> Dict[str, Any]:
         return _to_dict(self.resources.summary(resource_type))
@@ -268,19 +300,111 @@ class DashboardServer:
     def resource_audit(self) -> Dict[str, Any]:
         return {"items": self.resource_states.list_audit()}
 
+    # ------------------------------------------------------------------
+    # Runtime configuration
+    # ------------------------------------------------------------------
+
+    _SETTINGS = (
+        ("IKUAI_API_URL", "iKuai API 地址", "text", False),
+        ("IKUAI_USERNAME", "iKuai 用户名", "text", False),
+        ("IKUAI_PASSWORD", "iKuai 密码", "password", True),
+        ("IKUAI_TARGET_WAN_NAME", "目标 WAN", "select", False),
+        ("XRAY_BASE_DIR", "Xray/v2rayN 目录", "text", False),
+        ("XRAY_STARTUP_DELAY", "Xray 启动等待秒数", "number", False),
+        ("IP_ROTATION_MODE", "IP 策略", "select", False),
+        ("IP_STRICT_MODE", "严格 IP 检查", "boolean", False),
+        ("PROXY_ENABLED", "启用代理", "boolean", False),
+        ("PROXY_SERVER", "代理地址", "text", False),
+        ("PROXY_USERNAME", "代理用户名", "text", False),
+        ("PROXY_PASSWORD", "代理密码", "password", True),
+        ("PROXY_DYNAMIC_API_URL", "动态代理 API", "text", False),
+        ("MAX_ACCOUNTS", "默认批次数量", "number", False),
+        ("AUTO_MODE", "默认无人值守", "boolean", False),
+        ("CLOAKBROWSER_LICENSE_KEY", "CloakBrowser 授权密钥", "password", True),
+    )
+
+    @classmethod
+    def _setting_meta(cls) -> list[dict[str, Any]]:
+        options = {
+            "IKUAI_TARGET_WAN_NAME": ["adsl3", "adsl4", "adsl5", "adsl6", "adsl7"],
+            "IP_ROTATION_MODE": ["manual", "ikuai-single", "ikuai", "v2rayn+ikuai"],
+        }
+        values = {
+            "IKUAI_API_URL": config.IKUAI_CONFIG.get("api_url", ""),
+            "IKUAI_USERNAME": config.IKUAI_CONFIG.get("username", ""),
+            "IKUAI_PASSWORD": config.IKUAI_CONFIG.get("password", ""),
+            "IKUAI_TARGET_WAN_NAME": config.IKUAI_CONFIG.get("target_wan_name", ""),
+            "XRAY_BASE_DIR": config.XRAY_CONFIG.get("base_dir", ""),
+            "XRAY_STARTUP_DELAY": config.XRAY_CONFIG.get("startup_delay", 3.0),
+            "IP_ROTATION_MODE": config.IP_ROTATION_CONFIG.get("rotation_mode", "ikuai-single"),
+            "IP_STRICT_MODE": config.IP_ROTATION_CONFIG.get("strict_mode", True),
+            "PROXY_ENABLED": config.PROXY_CONFIG.get("enabled", False),
+            "PROXY_SERVER": config.PROXY_CONFIG.get("server", ""),
+            "PROXY_USERNAME": config.PROXY_CONFIG.get("username", ""),
+            "PROXY_PASSWORD": config.PROXY_CONFIG.get("password", ""),
+            "PROXY_DYNAMIC_API_URL": config.PROXY_CONFIG.get("dynamic_api_url", ""),
+            "MAX_ACCOUNTS": getattr(config, "MAX_ACCOUNTS", 0),
+            "AUTO_MODE": os.environ.get("AUTO_MODE", "false").lower() in {"1", "true", "yes"},
+            "CLOAKBROWSER_LICENSE_KEY": os.environ.get("CLOAKBROWSER_LICENSE_KEY", ""),
+        }
+        labels = {key: label for key, label, _type, _secret in cls._SETTINGS}
+        return [
+            {
+                "key": key,
+                "label": labels[key],
+                "type": field_type,
+                "secret": secret,
+                "value": "" if secret and values[key] else values[key],
+                "configured": bool(values[key]) if secret else True,
+                "options": options.get(key, []),
+            }
+            for key, _label, field_type, secret in cls._SETTINGS
+        ]
+
+    def get_settings(self) -> Dict[str, Any]:
+        return {"restart_required": False, "items": self._setting_meta()}
+
+    def save_settings(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        if self.production.state() is not None:
+            raise ValueError("运行期间不能修改配置，请先结束当前运行")
+        allowed = {key for key, _label, _type, _secret in self._SETTINGS}
+        updates = {str(key): value for key, value in body.items() if str(key) in allowed}
+        if not updates:
+            raise ValueError("没有可保存的配置项")
+        env_path = Path(getattr(config, "_ENV_FILE", Path(config.BASE_DIR) / ".env"))
+        existing = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+        lines = existing.splitlines()
+        seen: set[str] = set()
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key = stripped.split("=", 1)[0].strip()
+            if key in updates:
+                lines[index] = f"{key}={str(updates[key])}"
+                seen.add(key)
+        for key, value in updates.items():
+            if key not in seen:
+                lines.append(f"{key}={value}")
+        env_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        for key, value in updates.items():
+            os.environ[key] = str(value)
+        importlib.reload(config)
+        return self.get_settings()
+
     def add_email(self, body: Dict[str, Any]) -> Dict[str, Any]:
         return _to_dict(
-            self.resources.add_email(
+            self._redact_resource_view(self.resources.add_email(
                 str(body.get("email", "")),
                 str(body.get("password", "")),
                 str(body.get("client_id", "")),
                 str(body.get("refresh_token", "")),
-            )
+            ))
         )
 
     def edit_email(self, resource_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
         return _to_dict(
-            self.resources.edit_email(
+            self._redact_resource_view(self.resources.edit_email(
                 resource_id,
                 password=(
                     str(body["password"]) if body.get("password") else None
@@ -293,25 +417,25 @@ class DashboardServer:
                     if body.get("refresh_token")
                     else None
                 ),
-            )
+            ))
         )
 
     def add_card(self, body: Dict[str, Any]) -> Dict[str, Any]:
         return _to_dict(
-            self.resources.add_card(
+            self._redact_resource_view(self.resources.add_card(
                 str(body.get("card_no", "")),
                 str(body.get("expiry", "")),
                 str(body.get("cvc", "")),
-            )
+            ))
         )
 
     def edit_card(self, resource_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
         return _to_dict(
-            self.resources.edit_card(
+            self._redact_resource_view(self.resources.edit_card(
                 resource_id,
                 expiry=str(body["expiry"]) if body.get("expiry") else None,
                 cvc=str(body["cvc"]) if body.get("cvc") else None,
-            )
+            ))
         )
 
     def resource_allowed_actions(
@@ -338,7 +462,7 @@ class DashboardServer:
             reason=str(body.get("reason", "")),
             confirmed=bool(body.get("confirmed", False)),
         )
-        return _to_dict(view)
+        return _to_dict(self._redact_resource_view(view))
 
     def list_registered_accounts(
         self,
@@ -558,6 +682,12 @@ def _make_handler(server: DashboardServer, dist_dir: Path, allowed_origins: set)
                 if path == "/api/health":
                     self._send_json(200, {"status": "ok"})
                     return
+                if path == "/api/settings" and method == "GET":
+                    self._send_json(200, server.get_settings())
+                    return
+                if path == "/api/settings" and method == "PUT":
+                    self._send_json(200, server.save_settings(self._read_body()))
+                    return
                 if path == "/api/results/file" and method == "GET":
                     self._send_json(200, server.get_result_file())
                     return
@@ -762,6 +892,8 @@ def _make_handler(server: DashboardServer, dist_dir: Path, allowed_origins: set)
                     "RESULT_FILE_ENCODING": 422,
                 }.get(exc.code, 503)
                 self._send_error_json(status, exc.code, exc.message)
+            except ValueError as exc:
+                self._send_error_json(422, "INVALID_REQUEST", str(exc))
             except Exception:
                 self._send_error_json(
                     500, "INTERNAL_ERROR", "internal server error"
