@@ -29,6 +29,24 @@ from gpt_automation.utils.exceptions import ElementNotFoundError
 
 logger = logging.getLogger(__name__)
 
+MIN_SIGNUP_AGE = 20
+MAX_SIGNUP_AGE = 30
+
+
+def normalize_signup_age(value: str) -> str:
+    """Return a deterministic age accepted by the signup policy.
+
+    Input files from older runs may contain ages outside the desired 20–30
+    range.  Clamp those values before typing them into the OpenAI form so a
+    retry uses the same value and never replays an out-of-range age.
+    Invalid or empty values use the middle of the permitted range.
+    """
+    try:
+        age = int(str(value).strip())
+    except (TypeError, ValueError):
+        age = (MIN_SIGNUP_AGE + MAX_SIGNUP_AGE) // 2
+    return str(max(MIN_SIGNUP_AGE, min(MAX_SIGNUP_AGE, age)))
+
 
 CHATGPT_AUTH_LOGIN_URL = "https://chatgpt.com/auth/login"
 SIGNUP_PASSWORD_LINK_SELECTOR = "a[href='/create-account/password']"
@@ -750,6 +768,15 @@ async def phase1_form(page, name: str, age: str) -> None:
     """
     t0 = time.monotonic()
     logger.info("phase1_form: start (t=0.0s)")
+    signup_age = normalize_signup_age(age)
+    if str(age).strip() != signup_age:
+        logger.info(
+            "phase1_form: age %r normalized to %s (allowed range %d-%d)",
+            age,
+            signup_age,
+            MIN_SIGNUP_AGE,
+            MAX_SIGNUP_AGE,
+        )
 
     # ── Name: 共享逐键输入（已填正确值时跳过，避免覆盖重试现场）──
     name_input = page.locator(config.SELECTORS["name_input"]).first
@@ -764,17 +791,23 @@ async def phase1_form(page, name: str, age: str) -> None:
 
     # ── Age or birthdate ──
     logger.info("phase1_form: checking age input (t=%.1fs)", time.monotonic() - t0)
-    await _fill_age_or_birthdate(page, age, name_input=name_input)
+    await _fill_age_or_birthdate(page, signup_age, name_input=name_input)
     logger.info("phase1_form: age/birthdate filled (t=%.1fs)", time.monotonic() - t0)
 
     # 提交前读回：setter 写入后 React 可能未接受，值不一致则不提交。
-    await _assert_form_ready_before_submit(page, age)
+    await _assert_form_ready_before_submit(page, signup_age)
 
     await human_delay((0.8, 1.5))
     logger.info("phase1_form: pre-submit (t=%.1fs), clicking submit...", time.monotonic() - t0)
     await safe_click(page, [
+        "input[name='age'] >> xpath=ancestor::form >> button[type='submit']",
+        "button:text-is('続行')",
+        "button:has-text('続行')",
+        "button:text-is('Continue')",
+        "button:has-text('Continue')",
         "button:has-text('\u30a2\u30ab\u30a6\u30f3\u30c8\u306e\u4f5c\u6210\u3092\u5b8c\u4e86\u3059\u308b')",
         "button:has-text('Complete account creation')",
+        "button[type='submit']",
     ], timeout_ms=5000)
     logger.info("phase1_form: submit clicked (t=%.1fs)", time.monotonic() - t0)
     await human_delay((2.0, 4.0))
