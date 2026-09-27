@@ -162,8 +162,8 @@ GitHub Releases 会提供 `GPTAutomation-Setup-<version>.exe` 安装包。安装
 发布新版本时先更新根目录 `VERSION`，再创建同名标签并推送：
 
 ```powershell
-git tag v0.3.3
-git push origin main v0.3.3
+git tag v0.3.4
+git push origin main v0.3.4
 ```
 
 GitHub Actions 会校验标签与 `VERSION` 一致，构建并把

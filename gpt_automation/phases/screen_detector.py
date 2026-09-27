@@ -26,10 +26,10 @@ logger = logging.getLogger(__name__)
 class ScreenState(str, Enum):
     """Distinct ChatGPT screens the automation can encounter."""
 
-    LOGIN_EMAIL = "REDACTED"
-    LOGIN_PASSWORD = "REDACTED"
+    LOGIN_EMAIL = "login_email"
+    LOGIN_PASSWORD = "login_password"
     EMAIL_VERIFY_CODE = "email_verify"
-    SIGNUP_PASSWORD = "REDACTED"
+    SIGNUP_PASSWORD = "signup_password"
     REGISTRATION_FORM = "reg_form"
     LOGIN_MODAL = "login_modal"
     WELCOME_MODAL = "welcome"
