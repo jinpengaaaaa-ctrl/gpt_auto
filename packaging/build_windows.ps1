@@ -24,7 +24,11 @@ if (Test-Path 'dist\GPTAutomation') { Remove-Item -Recurse -Force 'dist\GPTAutom
   desktop_app.py
 
 if (Get-Command iscc -ErrorAction SilentlyContinue) {
-    iscc packaging\GPTAutomation.iss
+    $Version = (Get-Content VERSION -Raw).Trim().TrimStart('v')
+    if ($Version -notmatch '^\d+(\.\d+){1,3}$') {
+        throw "VERSION must contain a numeric semantic version, got '$Version'"
+    }
+    iscc "/DMyAppVersion=$Version" packaging\GPTAutomation.iss
 } else {
     Write-Warning 'Inno Setup (iscc.exe) is not installed; PyInstaller output is available at dist\GPTAutomation.'
 }

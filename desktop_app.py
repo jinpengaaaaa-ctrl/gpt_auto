@@ -16,6 +16,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 
@@ -257,7 +258,10 @@ class DashboardApp(tk.Tk):
             value = tk.Label(card, text="…", bg="white", fg="#20231f", font=("Segoe UI", 24, "bold"))
             value.pack(anchor="w", padx=18, pady=(16, 0))
             tk.Label(card, text=label, bg="white", fg="#737a70", font=("Segoe UI", 9)).pack(anchor="w", padx=18, pady=(0, 14))
-            self._async(lambda k=key: self._summary(k), lambda data, v=value: v.configure(text=str(data)))
+            def update_metric(data, widget=value):
+                if widget.winfo_exists():
+                    widget.configure(text=str(data))
+            self._async(lambda k=key: self._summary(k), update_metric)
         lower = tk.Frame(frame, bg="#f7f8f5")
         lower.pack(fill="both", expand=True, pady=(18, 0))
         current = self._card(lower, "当前任务")
@@ -344,21 +348,123 @@ class DashboardApp(tk.Tk):
     def _render_resources(self, frame: tk.Frame) -> None:
         for child in frame.winfo_children(): child.destroy()
         card = self._card(frame, "邮箱与卡片资源"); card.pack(fill="both", expand=True)
-        toolbar = tk.Frame(card, bg="white"); toolbar.pack(fill="x", padx=18, pady=10)
-        self._button(toolbar, "刷新资源", lambda: self.show_view("resources")).pack(side="right")
         notebook = ttk.Notebook(card); notebook.pack(fill="both", expand=True, padx=14, pady=(0, 14))
         for resource_type, label in (("email", "邮箱"), ("card", "卡片")):
             tab = tk.Frame(notebook, bg="white"); notebook.add(tab, text=label)
+            toolbar = tk.Frame(tab, bg="white"); toolbar.pack(fill="x", padx=8, pady=(8, 0))
+            self._button(toolbar, f"添加{label}", lambda t=resource_type: self._resource_dialog(t)).pack(side="left")
             tree = ttk.Treeview(tab, columns=("display", "state", "updated"), show="headings", height=15)
+            self._button(toolbar, "编辑选中", lambda t=resource_type, tr=tree: self._edit_selected_resource(t, tr)).pack(side="left", padx=6)
+            self._button(toolbar, "纠正状态", lambda t=resource_type, tr=tree: self._correct_selected_resource(t, tr)).pack(side="left")
+            self._button(toolbar, "刷新", self.show_view_resources).pack(side="right")
             for col, heading in (("display", "资源"), ("state", "状态"), ("updated", "更新时间")): tree.heading(col, text=heading); tree.column(col, width=260 if col=="display" else 150)
             tree.pack(fill="both", expand=True, padx=8, pady=8)
-            def load(t=resource_type, tr=tree):
-                try:
-                    data=self.api.request(f"/api/resources?type={t}")
-                    for item in data.get("items", []): tr.insert("", "end", values=(item.get("display",""),item.get("state",""),item.get("updated_at","")))
-                except Exception as exc: messagebox.showerror("加载失败", str(exc), parent=self)
-            self._async(load)
+            tree._resource_items = {}  # type: ignore[attr-defined]
+            def load(t=resource_type):
+                return self.api.request(f"/api/resources?type={t}")
+            def populate(data, tr=tree):
+                if not tr.winfo_exists():
+                    return
+                for child in tr.get_children():
+                    tr.delete(child)
+                tr._resource_items = {}  # type: ignore[attr-defined]
+                for item in data.get("items", []):
+                    iid = tr.insert("", "end", values=(item.get("display",""),item.get("state",""),item.get("updated_at","")))
+                    tr._resource_items[iid] = item  # type: ignore[attr-defined]
+            self._async(load, populate)
         hint=tk.Label(card,text="敏感字段只在本机提交给资源服务，列表中不会显示密码、token、完整卡号。",bg="white",fg="#737a70");hint.pack(anchor="w",padx=18,pady=(0,14))
+
+    def show_view_resources(self) -> None:
+        self.show_view("resources")
+
+    def _selected_resource(self, resource_type: str, tree: ttk.Treeview):
+        selected = tree.selection()
+        if not selected:
+            messagebox.showwarning("请选择资源", "请先在列表中选择一项资源。", parent=self)
+            return None
+        item = getattr(tree, "_resource_items", {}).get(selected[0])
+        if not item:
+            messagebox.showwarning("请刷新资源", "列表已过期，请刷新后重试。", parent=self)
+            return None
+        return item
+
+    def _edit_selected_resource(self, resource_type: str, tree: ttk.Treeview) -> None:
+        item = self._selected_resource(resource_type, tree)
+        if item is None:
+            return
+        if not item.get("editable"):
+            messagebox.showwarning("资源不可编辑", "占用中、已使用或隔离的资源不能直接编辑。", parent=self)
+            return
+        self._resource_dialog(resource_type, str(item.get("resource_id", "")))
+
+    def _correct_selected_resource(self, resource_type: str, tree: ttk.Treeview) -> None:
+        item = self._selected_resource(resource_type, tree)
+        if item is None:
+            return
+        actions = [action for action in item.get("state_actions", []) if action.get("enabled")]
+        if not actions:
+            messagebox.showwarning("无法纠正状态", "当前资源没有可用的状态纠正操作。", parent=self)
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title("纠正资源状态")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.geometry("430x250")
+        tk.Label(dialog, text=f"资源：{item.get('display', '')}", anchor="w").pack(fill="x", padx=18, pady=(18, 8))
+        tk.Label(dialog, text="状态纠正会写入本机执行履历，请确认你已核对真实资源状态。", fg="#865b19", wraplength=380, justify="left").pack(fill="x", padx=18, pady=8)
+        reason = tk.StringVar()
+        ttk.Entry(dialog, textvariable=reason).pack(fill="x", padx=18, pady=8)
+        buttons = tk.Frame(dialog); buttons.pack(fill="x", padx=18, pady=12)
+        for action in actions:
+            def submit(a=action):
+                if not messagebox.askyesno("确认状态纠正", f"确定将资源状态改为“{a.get('label', a.get('target_state'))}”吗？", parent=dialog):
+                    return
+                body = {"target": a.get("target_state", ""), "reason": reason.get(), "confirmed": True}
+                self._async(
+                    lambda: self.api.request(f"/api/resources/{'emails' if resource_type == 'email' else 'cards'}/{quote(str(item.get('resource_id', '')), safe='@+._-')}/state-corrections", "POST", body),
+                    lambda _result: (dialog.destroy(), self.show_view("resources")),
+                )
+            self._button(buttons, str(action.get("label", action.get("target_state", "操作"))), submit).pack(side="left", padx=3)
+        self._button(dialog, "取消", dialog.destroy).pack(pady=(0, 12))
+
+    def _resource_dialog(self, resource_type: str, resource_id: str | None = None) -> None:
+        editing = bool(resource_id)
+        is_email = resource_type == "email"
+        title = ("编辑" if editing else "添加") + ("邮箱资源" if is_email else "卡片资源")
+        dialog = tk.Toplevel(self)
+        dialog.title(title)
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.geometry("540x360" if is_email else "430x270")
+        fields = [("邮箱", "email", False), ("邮箱密码", "password", True), ("OAuth Client ID", "client_id", False), ("Refresh Token", "refresh_token", True)] if is_email else [("卡号", "card_no", True), ("有效期（MMYY 或 MM/YYYY）", "expiry", False), ("CVC", "cvc", True)]
+        values: dict[str, tk.StringVar] = {}
+        body = tk.Frame(dialog); body.pack(fill="both", expand=True, padx=20, pady=16)
+        for row, (label, key, secret) in enumerate(fields):
+            tk.Label(body, text=label, anchor="w").grid(row=row, column=0, sticky="w", padx=(0, 12), pady=7)
+            var = tk.StringVar()
+            values[key] = var
+            entry = ttk.Entry(body, textvariable=var, show="•" if secret else "")
+            entry.grid(row=row, column=1, sticky="ew", pady=7)
+            if editing and key in {"email", "card_no"}:
+                entry.configure(state="disabled")
+        body.columnconfigure(1, weight=1)
+        tk.Label(dialog, text="敏感信息仅写入本机资源文件，列表不会回显完整值。", fg="#737a70", wraplength=470, justify="left").pack(fill="x", padx=20, pady=(0, 8))
+        buttons = tk.Frame(dialog); buttons.pack(fill="x", padx=20, pady=(0, 16))
+        def submit() -> None:
+            payload = {key: var.get().strip() for key, var in values.items() if not (editing and key in {"email", "card_no"})}
+            if not editing:
+                payload.update({key: var.get().strip() for key, var in values.items()})
+            endpoint = "/api/resources/emails" if is_email else "/api/resources/cards"
+            method = "POST"
+            if editing:
+                endpoint += "/" + quote(str(resource_id), safe="@+._-")
+                method = "PATCH"
+            self._async(
+                lambda: self.api.request(endpoint, method, payload),
+                lambda _result: (dialog.destroy(), self.show_view("resources"), messagebox.showinfo("已保存", "资源已保存到本机。", parent=self)),
+            )
+        self._button(buttons, "保存", submit, True).pack(side="right")
+        self._button(buttons, "取消", dialog.destroy).pack(side="right", padx=8)
 
     def _render_accounts(self, frame: tk.Frame) -> None: self._render_table(frame, "已创建账户", "/api/registered-accounts", ("email", "status", "offer_status", "browser_backend", "updated_at"))
     def _render_history(self, frame: tk.Frame) -> None: self._render_table(frame, "运行记录", "/api/history", ("session_id", "stage", "status", "last_error", "updated_at"))
@@ -367,15 +473,21 @@ class DashboardApp(tk.Tk):
         for col in columns: tree.heading(col,text=col);tree.column(col,width=170)
         tree.pack(fill="both",expand=True,padx=14,pady=14)
         def load():
-            try:
-                data=self.api.request(endpoint)
-                for item in data.get("items",[]): tree.insert("","end",values=tuple(item.get(c,"-") for c in columns))
-            except Exception as exc: messagebox.showerror("加载失败",str(exc),parent=self)
-        self._async(load)
+            return self.api.request(endpoint)
+        def populate(data):
+            if not tree.winfo_exists():
+                return
+            for child in tree.get_children():
+                tree.delete(child)
+            for item in data.get("items",[]):
+                tree.insert("","end",values=tuple(item.get(c,"-") for c in columns))
+        self._async(load, populate)
 
     def _render_settings(self, frame: tk.Frame) -> None:
         card=self._card(frame,"运行配置");card.pack(fill="both",expand=True); body=tk.Frame(card,bg="white");body.pack(fill="both",expand=True,padx=18,pady=10)
         def done(data):
+            if not body.winfo_exists():
+                return
             entries={}
             for item in data.get("items",[]):
                 row=tk.Frame(body,bg="white");row.pack(fill="x",pady=5);tk.Label(row,text=f"{item['label']}  ({item['key']})",bg="white",fg="#596159",width=34,anchor="w").pack(side="left")

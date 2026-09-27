@@ -1,7 +1,9 @@
 #define MyAppName "GPT Automation"
 #define MyAppPublisher "jpwcreate"
 #define MyAppExeName "GPTAutomation.exe"
-#define MyAppVersion "0.3.0"
+#ifndef MyAppVersion
+  #define MyAppVersion "0.0.0"
+#endif
 
 [Setup]
 AppId={{B7B78B07-AB17-4D7E-9189-7E1B9355D35A}

@@ -115,7 +115,7 @@ python -m gpt_automation --inspect-profile PROFILE_ID
 - `1`：网络、输入或环境导致批次失败；
 - `2`：存在需要用户继续处理的账户。
 
-## 桌面端控制台（实验性）
+## 桌面端控制台
 
 项目附带一个本机桌面端流程控制台，用于查看 Phase 1–4 流程、配置运行参数、管理邮箱与信用卡资源、查询执行履历。
 
@@ -135,9 +135,9 @@ python -m gpt_automation.web --port 8765
 注意：
 
 - 服务只绑定本机回环地址，没有远程访问能力。
-- 「开始运行」当前为演示模式，只模拟步骤推进，不执行真实浏览器注册、支付或取消订阅；生产接线到 `RegistrationWorkflow` 属于后续迭代。
+- 「开始运行」默认执行真实生产流程：会调用现有 `RegistrationWorkflow`，并在浏览器、网络、支付或取消订阅等需要人工确认的节点暂停。开始前必须先完成预检。
 - 资源管理可以新增／编辑可用邮箱与信用卡；占用中、已使用、隔离资源保持只读；卡号、CVC、邮箱密码与 token 不会回显。
-- 真实账户流程请继续使用原有 `start.bat` 或 CLI 入口。
+- CLI 和 `start.bat` 仍可用于无桌面环境；桌面控制台与 CLI 共用同一套工作流、资源租约和 SQLite 执行履历。
 
 ## Windows 桌面版
 
@@ -158,6 +158,16 @@ GitHub Releases 会提供 `GPTAutomation-Setup-<version>.exe` 安装包。安装
 
 脚本需要 Python 3.12、Inno Setup 和项目依赖；没有 Inno Setup 时仍会生成
 `dist/GPTAutomation/` 的可运行目录。
+
+发布新版本时先更新根目录 `VERSION`，再创建同名标签并推送：
+
+```powershell
+git tag v0.3.0
+git push origin main v0.3.0
+```
+
+GitHub Actions 会校验标签与 `VERSION` 一致，构建并把
+`GPTAutomation-Setup-<version>.exe` 附加到对应 Release。
 
 ## 核心结构
 

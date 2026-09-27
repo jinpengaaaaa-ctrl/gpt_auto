@@ -16,6 +16,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Validate tag version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim().TrimStart('v')
+          $tag = '${{ github.ref_name }}'.TrimStart('v')
+          if ($version -ne $tag) {
+            throw "VERSION ($version) must match release tag ($tag)"
+          }
       - name: Install Inno Setup
         shell: pwsh
         run: choco install innosetup --no-progress -y
