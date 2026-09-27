@@ -22,12 +22,14 @@ from urllib.request import Request, urlopen
 
 if getattr(sys, "frozen", False):
     APP_ROOT = Path(sys.executable).resolve().parent
+    RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", APP_ROOT))
     _data_dir = os.environ.get("GPT_AUTOMATION_DATA_DIR")
     DATA_ROOT = Path(_data_dir) if _data_dir else Path(
         os.environ.get("LOCALAPPDATA", Path.home())
     ) / "GPTAutomation"
 else:
     APP_ROOT = Path(__file__).resolve().parent
+    RESOURCE_ROOT = APP_ROOT
     DATA_ROOT = Path(os.environ.get("GPT_AUTOMATION_DATA_DIR", APP_ROOT))
 
 
@@ -37,7 +39,7 @@ def _copy_seed_files() -> None:
     for name in ("input", "accounts", "runtime", "profiles", "evidence", "TMP"):
         (DATA_ROOT / name).mkdir(parents=True, exist_ok=True)
     env_path = DATA_ROOT / ".env"
-    seed = APP_ROOT / ".env.example"
+    seed = RESOURCE_ROOT / ".env.example"
     if not env_path.exists() and seed.exists():
         env_path.write_text(seed.read_text(encoding="utf-8"), encoding="utf-8")
 
@@ -99,7 +101,7 @@ class DashboardApp(tk.Tk):
         os.environ.setdefault("GPT_AUTOMATION_DATA_DIR", str(DATA_ROOT))
         from gpt_automation.web.server import serve
 
-        dist = APP_ROOT / "frontend" / "dist"
+        dist = RESOURCE_ROOT / "frontend" / "dist"
         self._server = serve(
             project_root=APP_ROOT,
             input_dir=DATA_ROOT / "input",
