@@ -339,11 +339,35 @@ class DashboardApp(tk.Tk):
             box = tk.Frame(parent, bg="#fff4df"); box.pack(fill="x", padx=18, pady=12)
             tk.Label(box, text=request.get("title", "需要人工处理"), bg="#fff4df", fg="#865b19", font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=10, pady=(10, 4))
             tk.Label(box, text=request.get("instruction", request.get("description", "")), bg="#fff4df", fg="#865b19", wraplength=380, justify="left").pack(anchor="w", padx=10, pady=4)
-            for decision in request.get("allowed_decisions", []): self._button(box, decision, lambda d=decision: self._decide(d)).pack(fill="x", padx=10, pady=3)
-        self._button(parent, "安全停止", self._stop_run).pack(anchor="e", padx=18, pady=10)
+            labels = {
+                "verify_manual": "已完成，请验证",
+                "advance_after_manual": "继续下一步",
+                "retry_auto": "重试自动步骤",
+                "skip_account": "跳过账户",
+                "defer_account": "稍后处理",
+                "abort_batch": "终止批次",
+                "keep_open": "保持浏览器打开",
+                "restart_browser": "重启浏览器",
+                "confirm_network": "确认网络已切换",
+                "retry_network": "重新检查网络",
+                "switch_network": "切换网络后重试",
+                "reuse_ip": "沿用当前 IP",
+            }
+            for decision in request.get("allowed_decisions", []):
+                self._button(box, labels.get(decision, decision), lambda d=decision: self._decide(d)).pack(fill="x", padx=10, pady=3)
+        actions = tk.Frame(parent, bg="white")
+        actions.pack(fill="x", padx=18, pady=10)
+        self._button(actions, "安全停止", self._stop_run).pack(side="right")
+        if self.run_state.get("status") == "STOPPING" or (
+            self.run_state.get("status") == "NEEDS_OPERATOR"
+            and not request
+            and self.run_state.get("last_error")
+        ):
+            self._button(actions, "强制结束", self._force_stop).pack(side="right", padx=8)
 
     def _decide(self, decision: str) -> None: self._async(lambda: self.api.request("/api/runs/decisions", "POST", {"decision": decision}), lambda s: setattr(self, "run_state", s))
     def _stop_run(self) -> None: self._async(lambda: self.api.request("/api/runs/stop", "POST"), lambda s: setattr(self, "run_state", s))
+    def _force_stop(self) -> None: self._async(lambda: self.api.request("/api/runs/force-stop", "POST"), lambda s: setattr(self, "run_state", s))
 
     def _render_resources(self, frame: tk.Frame) -> None:
         for child in frame.winfo_children(): child.destroy()
