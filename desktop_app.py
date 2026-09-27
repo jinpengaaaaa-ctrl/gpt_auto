@@ -21,7 +21,8 @@ from urllib.request import Request, urlopen
 
 if getattr(sys, "frozen", False):
     APP_ROOT = Path(sys.executable).resolve().parent
-    DATA_ROOT = Path(os.environ.get("GPT_AUTOMATION_DATA_DIR", "")) or Path(
+    _data_dir = os.environ.get("GPT_AUTOMATION_DATA_DIR")
+    DATA_ROOT = Path(_data_dir) if _data_dir else Path(
         os.environ.get("LOCALAPPDATA", Path.home())
     ) / "GPTAutomation"
 else:
@@ -166,7 +167,7 @@ class DashboardApp(tk.Tk):
         for name, button in self.nav_buttons.items():
             button.configure(bg="#344438" if name == key else "#1f2921",
                              fg="white" if name == key else "#bac8bc")
-        labels = dict(self.NAV)
+        labels = {key: label for label, key in self.NAV}
         self.page_title.configure(text=labels[key])
         for child in self.body.winfo_children():
             child.destroy()
