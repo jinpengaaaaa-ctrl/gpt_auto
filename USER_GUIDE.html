@@ -1,0 +1,339 @@
+﻿
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ChatGPT 自动注册工具 · 使用手册 v0.2.9</title>
+<style>
+  :root {
+    --bg: #FAF8F4;
+    --ink: #2B2B28;
+    --ink-soft: #5D5B55;
+    --line: #E4E0D8;
+    --sage: #8A9B8E;
+    --sage-deep: #6E8073;
+    --terra: #C4775A;
+    --terra-deep: #A85F45;
+    --amber: #B98A2F;
+    --card: #FFFFFF;
+    --shadow: 0 1px 2px rgba(43,43,40,.05), 0 8px 24px rgba(43,43,40,.06);
+    --mono: "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
+    --sans: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body { background: var(--bg); color: var(--ink); font-family: var(--sans); line-height: 1.75; font-size: 15px; }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 0 24px 80px; }
+  header { padding: 64px 0 40px; border-bottom: 1px solid var(--line); margin-bottom: 48px; }
+  .kicker { font-family: var(--mono); font-size: 12px; letter-spacing: .18em; text-transform: uppercase; color: var(--sage-deep); margin-bottom: 14px; }
+  h1 { font-size: 34px; font-weight: 700; letter-spacing: -.01em; }
+  .sub { color: var(--ink-soft); margin-top: 10px; max-width: 620px; }
+  .badges { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 20px; }
+  .badge { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; padding: 4px 12px; border-radius: 999px; border: 1px solid var(--line); background: var(--card); }
+  .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+  .dot.ok { background: var(--sage); }
+  .dot.wip { background: var(--amber); }
+  nav.toc { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 22px 26px; margin-bottom: 48px; box-shadow: var(--shadow); }
+  nav.toc b { font-size: 13px; color: var(--ink-soft); display: block; margin-bottom: 10px; }
+  nav.toc a { display: inline-block; color: var(--sage-deep); text-decoration: none; margin: 2px 18px 2px 0; font-size: 14px; }
+  nav.toc a:hover { color: var(--terra-deep); text-decoration: underline; }
+  section { margin-bottom: 56px; }
+  h2 { font-size: 22px; font-weight: 700; padding-bottom: 10px; border-bottom: 2px solid var(--ink); margin-bottom: 18px; }
+  h2 .no { font-family: var(--mono); color: var(--terra); margin-right: 10px; font-size: 15px; }
+  h3 { font-size: 16px; margin: 26px 0 10px; }
+  p { margin: 10px 0; }
+  .muted { color: var(--ink-soft); font-size: 13.5px; }
+  .steps { counter-reset: step; display: flex; flex-direction: column; gap: 12px; }
+  .step { display: flex; gap: 16px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px 20px; box-shadow: var(--shadow); }
+  .step .num { counter-increment: step; flex: 0 0 30px; height: 30px; border-radius: 8px; background: var(--ink); color: #fff; display: flex; align-items: center; justify-content: center; font-family: var(--mono); font-size: 14px; margin-top: 2px; }
+  .step .num::after { content: counter(step); }
+  .step .body { flex: 1; }
+  .step .body b { display: block; font-size: 14.5px; margin-bottom: 2px; }
+  .step .body span { color: var(--ink-soft); font-size: 13.5px; }
+  .terminal { background: #23231F; color: #E8E6DF; border-radius: 12px; font-family: var(--mono); font-size: 12.5px; line-height: 1.9; padding: 18px 20px; margin: 16px 0; overflow-x: auto; box-shadow: var(--shadow); }
+  .terminal .bar { display: flex; gap: 6px; margin-bottom: 12px; }
+  .terminal .bar i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .terminal .bar i:nth-child(1) { background: #C4775A; }
+  .terminal .bar i:nth-child(2) { background: #B98A2F; }
+  .terminal .bar i:nth-child(3) { background: #8A9B8E; }
+  .terminal .cmd { color: #A9C3B2; }
+  .terminal .sel { color: #F0C987; }
+  .terminal .hint { color: #8B8B84; }
+  .caption { font-size: 12px; color: var(--ink-soft); margin-top: 6px; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 13.5px; }
+  th, td { border: 1px solid var(--line); padding: 9px 12px; text-align: left; }
+  th { background: #F1EEE7; font-weight: 600; }
+  pre.code { background: #F3F0EA; border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; font-family: var(--mono); font-size: 12.5px; overflow-x: auto; margin: 12px 0; line-height: 1.8; }
+  .shot { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; margin: 14px 0; box-shadow: var(--shadow); background: var(--card); }
+  .shot img { width: 100%; display: block; }
+  .shot .cap { padding: 8px 14px; font-size: 12.5px; color: var(--ink-soft); }
+  .alert { border-left: 3px solid var(--terra); background: #FBF1EC; padding: 12px 16px; border-radius: 0 10px 10px 0; margin: 14px 0; font-size: 13.5px; }
+  .alert.sage { border-left-color: var(--sage); background: #EFF3EF; }
+  .alert.amber { border-left-color: var(--amber); background: #F7F0E0; }
+  .flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 8px; margin: 16px 0; }
+  .flow .node { flex: 1 1 130px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; box-shadow: var(--shadow); font-size: 13px; }
+  .flow .node b { display: block; font-size: 13.5px; margin-bottom: 3px; }
+  .flow .node span { color: var(--ink-soft); font-size: 12px; }
+  .flow .arrow { align-self: center; color: var(--sage-deep); font-size: 18px; font-family: var(--mono); }
+  .env-card { background: #F3F0EA; border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; font-family: var(--mono); font-size: 12.5px; line-height: 1.9; margin: 12px 0; overflow-x: auto; }
+  .env-card .key { color: var(--terra-deep); font-weight: 600; }
+  .env-card .val { color: var(--sage-deep); }
+  footer { border-top: 1px solid var(--line); padding-top: 20px; font-size: 12.5px; color: var(--ink-soft); }
+  @media (max-width: 640px) { h1 { font-size: 26px; } header { padding: 40px 0 28px; } .step { flex-direction: column; gap: 8px; } .flow { flex-direction: column; } .flow .arrow { transform: rotate(90deg); } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="kicker">ChatGPT Auto-Registration · v0.2.9</div>
+  <h1>ChatGPT 自动注册工具<br>使用手册</h1>
+  <p class="sub">自动完成「注册 ChatGPT 账号」的桌面小工具：自动打开浏览器、填写资料、收取邮箱验证码、绑定双重验证，并把账号信息整理成文件给你。</p>
+  <div class="badges">
+    <span class="badge"><i class="dot ok"></i>创建账号 · 可用</span>
+    <span class="badge"><i class="dot ok"></i>开通会员 · 可用</span>
+    <span class="badge"><i class="dot wip"></i>Firefox 后端 · 开发中</span>
+  </div>
+</header>
+
+<nav class="toc">
+  <b>目录</b>
+  <a href="#s1">1. 需要准备什么</a>
+  <a href="#s2">2. 第一次使用（安装）</a>
+  <a href="#s3">3. 放入邮箱和卡片</a>
+  <a href="#s4">4. 选择 IP 切换方式</a>
+  <a href="#s5">5. 配置自动 IP 切换</a>
+  <a href="#s6">6. 开始创建账号</a>
+  <a href="#s7">7. 结果在哪里看</a>
+  <a href="#s8">8. 常见问题</a>
+  <a href="#s9">9. 安全提醒</a>
+</nav>
+
+<section id="s1">
+  <h2><span class="no">01</span>需要准备什么</h2>
+  <div class="steps">
+    <div class="step"><div class="num"></div><div class="body"><b>一台 Windows 电脑</b><span>Windows 10 或 11 均可。</span></div></div>
+    <div class="step"><div class="num"></div><div class="body"><b>Python 3.12</b><span>第一次安装时要用，装好后基本不用管它（下载地址见下节）。</span></div></div>
+    <div class="step"><div class="num"></div><div class="body"><b>一批可用的 Outlook 邮箱</b><span>放在 input 文件夹里，程序用它注册账号并收取验证码。</span></div></div>
+    <div class="step"><div class="num"></div><div class="body"><b>信用卡信息（开通会员时用）</b><span>创建账号阶段用不到，以后开通会员功能上线时才会用到。</span></div></div>
+    <div class="step"><div class="num"></div><div class="body"><b>IP 切换方案（二选一）</b><span>自动模式：v2rayN 客户端 + iKuai 路由器（推荐，可无人值守）；手动模式：Pocket WiFi / 手机热点（少量注册时用）。详见第 4、5 节。</span></div></div>
+    <div class="step"><div class="num"></div><div class="body"><b>网络环境已配置好</b><span>本包已内置网络配置，如需调整请咨询技术人员。</span></div></div>
+  </div>
+</section>
+
+<section id="s2">
+  <h2><span class="no">02</span>第一次使用（安装环境）</h2>
+  <p>整个安装只需要双击一个文件，工具会自动完成：创建环境、安装依赖、下载浏览器组件。</p>
+  <div class="steps">
+    <div class="step"><div class="num"></div><div class="body"><b>安装 Python 3.12</b><span>电脑没有 Python 的话，打开 <a href="https://www.python.org/downloads/" target="_blank" rel="noopener">python.org/downloads</a> 下载安装，安装时务必勾选「Add python.exe to PATH」。已有则跳过。</span></div></div>
+    <div class="step"><div class="num"></div><div class="body"><b>双击运行 install.bat</b><span>看到黑色窗口自动滚动，等待几分钟直到出现 Setup finished 即安装完成。</span></div></div>
+    <div class="step"><div class="num"></div><div class="body"><b>（可选）确认 .env 配置</b><span>本包已附带 .env 配置文件。使用自动 IP 模式时，需要确认其中 v2rayN 路径与 iKuai 设置是否正确（见第 5 节）。</span></div></div>
+  </div>
+  <div class="alert sage">安装完成后，项目文件夹里会多出 .venv、TMP 等文件夹，这是正常的，不用管它们。</div>
+</section>
+
+<section id="s3">
+  <h2><span class="no">03</span>放入你的邮箱和卡片</h2>
+  <p>打开 <b>input</b> 文件夹，里面有两个文件需要你替换成自己的真实数据（当前是示例样本）：</p>
+  <table>
+    <tr><th>文件</th><th>怎么填</th><th>示例</th></tr>
+    <tr><td><code>email.txt</code></td><td>每行一个邮箱，用 <code>----</code> 分成 4 段：邮箱----邮箱密码----client_id----refresh_token</td><td><code>account@example.com----邮箱密码----</code></td></tr>
+    <tr><td><code>cards.csv</code></td><td>每行一张卡，9 列逗号分隔，卡号=16 位卡号、有效期=MMYY、CVC=3 位</td><td><code>,4111111111111111,0731,051,...</code></td></tr>
+    <tr><td><code>cards.example.csv</code></td><td>填写模板，把内容复制到 cards.csv 再改成你的卡</td><td>—</td></tr>
+    <tr><td><code>address_jp.csv</code> / <code>buildings_jp.csv</code></td><td>地址与大楼数据库，已内置真实数据，不用改</td><td>—</td></tr>
+  </table>
+  <div class="alert amber">运行前必须把 email.txt 和 cards.csv 里的示例数据替换成你自己的真实数据。如果忘了替换，程序会在开始前检测并提醒你。</div>
+  <h3>填写时注意</h3>
+  <div class="alert">
+    <b>email.txt 的 4 段含义：</b>邮箱地址、邮箱登录密码、微软 OAuth2 的 client_id、refresh_token（后两项用于自动收取验证码）。<br>
+    每行只能有一个邮箱，段与段之间用 <code>----</code>（4 个半角连字符）分隔，不要加空格。<br>
+    邮箱必须是 Outlook 系（outlook.jp / outlook.com 等），普通邮箱无法接收自动验证。<br>
+    <b>cards.csv：</b>逗号必须用半角，不要有多余空格；卡号、有效期（MMYY）、CVC 不要写错位数。<br>
+    文件编码保持 UTF-8，不要用 Excel 另存为其他格式。
+  </div>
+</section>
+
+<section id="s4">
+  <h2><span class="no">04</span>选择 IP 切换方式</h2>
+  <p>注册多个账号时，每个账号应使用不同的出口 IP，避免被 ChatGPT 风控。工具有两种 IP 切换方式：</p>
+  <table>
+    <tr><th>对比项</th><th>自动模式（推荐）</th><th>手动模式</th></tr>
+    <tr><td>需要什么</td><td>v2rayN（Xray）+ iKuai 路由器</td><td>Pocket WiFi / 手机热点</td></tr>
+    <tr><td>怎么换 IP</td><td>程序自动切换节点 + 自动重拨 ADSL，全程无人值守</td><td>每完成 1 个账号程序响提示音，你手动重连网络</td></tr>
+    <tr><td>适合场景</td><td>批量注册、批量开通会员、无人值守</td><td>少量注册、临时使用、没有 iKuai 环境</td></tr>
+    <tr><td>配置项</td><td><code>IP_ROTATION_MODE=ikuai-single</code>（当前默认）</td><td><code>IP_ROTATION_MODE=manual-hotspot</code></td></tr>
+  </table>
+  <h3>自动模式工作流程</h3>
+  <div class="flow">
+    <div class="node"><b>v2rayN 节点</b><span>从 v2rayN 读取节点配置</span></div>
+    <div class="arrow">→</div>
+    <div class="node"><b>启动 Xray 代理</b><span>程序自己启动 xray.exe，建立本地代理</span></div>
+    <div class="arrow">→</div>
+    <div class="node"><b>开启系统代理</b><span>浏览器流量走代理出口</span></div>
+    <div class="arrow">→</div>
+    <div class="node"><b>注册 1 个账号</b><span>验证出口 IP 安全后开始</span></div>
+    <div class="arrow">→</div>
+    <div class="node"><b>iKuai 重拨</b><span>ADSL 线路重拨，换新出口 IP</span></div>
+    <div class="arrow">→</div>
+    <div class="node"><b>下一个账号</b><span>循环直到全部完成</span></div>
+  </div>
+  <p class="muted">手动模式下，程序会在每完成 1 个账号后播放提示音并等待，你手动切换 Pocket WiFi / 手机热点重连后，程序检测到 IP 变化即自动继续。</p>
+</section>
+
+<section id="s5">
+  <h2><span class="no">05</span>配置自动 IP 切换</h2>
+  <p>使用自动模式前，需要完成三件事：安装 v2rayN、设置 XRAY_BASE_DIR 路径、配置 iKuai 路由器。以下按顺序说明。</p>
+
+  <h3>5.1 安装并配置 v2rayN</h3>
+  <div class="steps">
+    <div class="step"><div class="num"></div><div class="body"><b>下载 v2rayN</b><span>从官方渠道下载 Windows 64 位版本，解压到一个固定的英文路径，例如 <code>D:\tool\v2rayN-windows-64</code>。</span></div></div>
+    <div class="step"><div class="num"></div><div class="body"><b>导入你的节点</b><span>在 v2rayN 里导入你的订阅或节点（VLESS Reality 等），确认节点能连通。节点数据会保存到它的 guiNDB.db 数据库里。</span></div></div>
+    <div class="step"><div class="num"></div><div class="body"><b>确认目录里有 xray.exe</b><span>程序运行时不打开 v2rayN 界面，而是直接使用它目录下的文件：<code>bin\xray\xray.exe</code>（Xray 主程序）和 <code>guiConfigs\guiNDB.db</code>（节点数据库）。安装完整版 v2rayN 通常自带这些文件。</span></div></div>
+  </div>
+  <div class="alert sage">运行时不需要手动打开 v2rayN 界面，也不需要开启它的 Local API。程序会自己读取节点数据、自己启动 Xray。</div>
+
+  <h3>5.2 设置 XRAY_BASE_DIR（重要）</h3>
+  <p><code>XRAY_BASE_DIR</code> 是 <b>v2rayN 在你电脑上的安装路径</b>，程序靠它找到 xray.exe 和节点数据库。它写在项目根目录的 <b>.env</b> 文件里：</p>
+  <div class="env-card">
+    <span class="key">XRAY_BASE_DIR</span>=<span class="val">D:\tool\v2rayN-windows-64</span>
+  </div>
+  <div class="alert amber">
+    <b>必须改成你自己电脑上 v2rayN 的实际路径。</b>路径不对时，程序会报「Xray 启动失败」，注册流程无法开始。<br>
+    改完保存 .env 后再启动工具，不要开着工具时改。
+  </div>
+  <p>程序会在 <code>XRAY_BASE_DIR</code> 指向的目录下查找这些文件：</p>
+  <table>
+    <tr><th>文件</th><th>用途</th><th>检查方式</th></tr>
+    <tr><td><code>bin\xray\xray.exe</code></td><td>Xray 主程序，负责建立代理通道</td><td>在资源管理器中确认该文件存在</td></tr>
+    <tr><td><code>guiConfigs\guiNDB.db</code></td><td>v2rayN 的节点数据库，程序从这里读取节点配置</td><td>在 v2rayN 里导入过节点后自动生成</td></tr>
+    <tr><td><code>guiConfigs\&lt;节点名&gt;.json</code></td><td>备用配置（数据库读取失败时使用）</td><td>一般不需要手动准备</td></tr>
+  </table>
+
+  <h3>5.3 配置 iKuai 路由器</h3>
+  <p>iKuai 负责每个账号注册完成后重拨 ADSL 线路，让出口 IP 变化。需要确认以下设置：</p>
+  <div class="steps">
+    <div class="step"><div class="num"></div><div class="body"><b>确认路由器管理地址</b><span>在 .env 里找到 <code>IKUAI_API_URL</code>，填 iKuai 的管理地址（如 <code>http://192.168.1.1</code> 或你的域名地址）。</span></div></div>
+    <div class="step"><div class="num"></div><div class="body"><b>填入管理员账号密码</b><span><code>IKUAI_USERNAME</code> 和 <code>IKUAI_PASSWORD</code> 填 iKuai 管理后台的登录账号密码。</span></div></div>
+    <div class="step"><div class="num"></div><div class="body"><b>确认要重拨的线路名</b><span><code>IKUAI_TARGET_WAN_NAME</code> 填要重拨的 ADSL 线路名称（如 adsl3）。这个名字必须与 iKuai 管理后台里显示的外网线路名称一致，否则程序找不到线路。</span></div></div>
+    <div class="step"><div class="num"></div><div class="body"><b>验证连通</b><span>确保电脑能正常打开 iKuai 管理后台，且能看到对应线路在线。</span></div></div>
+  </div>
+
+  <h3>5.4 .env 网络配置一览</h3>
+  <p>以下是与网络和 IP 切换直接相关的全部配置项，一般由技术人员预设，用户只需重点确认 <code>XRAY_BASE_DIR</code>：</p>
+  <table>
+    <tr><th>配置项</th><th>含义</th><th>当前值示例</th></tr>
+    <tr><td><code>IP_ROTATION_MODE</code></td><td>IP 切换模式</td><td><code>ikuai-single</code>（自动）</td></tr>
+    <tr><td><code>XRAY_BASE_DIR</code></td><td>v2rayN 安装路径（重点确认）</td><td><code>D:\tool\v2rayN-windows-64</code></td></tr>
+    <tr><td><code>IKUAI_API_URL</code></td><td>iKuai 路由器管理地址</td><td><code>http://192.168.1.1</code></td></tr>
+    <tr><td><code>IKUAI_USERNAME</code> / <code>IKUAI_PASSWORD</code></td><td>iKuai 管理员账号 / 密码</td><td><code>admin</code> / <code>****</code></td></tr>
+    <tr><td><code>IKUAI_TARGET_WAN_NAME</code></td><td>要重拨的 ADSL 线路名（须与后台一致）</td><td><code>adsl3</code></td></tr>
+    <tr><td><code>PROXY_PORT</code></td><td>本地代理端口（与 Xray 一致）</td><td><code>10808</code></td></tr>
+  </table>
+</section>
+
+<section id="s6">
+  <h2><span class="no">06</span>开始创建账号</h2>
+  <div class="steps">
+    <div class="step"><div class="num"></div><div class="body"><b>双击运行 start.bat</b><span>先出现浏览器组件检查信息（正常），随后出现菜单。</span></div></div>
+    <div class="step"><div class="num"></div><div class="body"><b>任务类型选 1</b><span>输入 1 选择「创建账号」，按回车。</span></div></div>
+    <div class="step"><div class="num"></div><div class="body"><b>选择创建数量</b><span>1 / 5 / 10 个，或选 4 自定义数量。</span></div></div>
+    <div class="step"><div class="num"></div><div class="body"><b>选择 IP 切换模式</b><span>默认 1 自动（iKuai）。如果当前没有 v2rayN / iKuai 环境，选 2 手动模式。</span></div></div>
+    <div class="step"><div class="num"></div><div class="body"><b>确认执行</b><span>信息无误后输入 Y 回车，工具开始自动工作。</span></div></div>
+    <div class="step"><div class="num"></div><div class="body"><b>等待完成</b><span>期间不要关窗口、不要动鼠标键盘，每个账号约需几分钟，结束后会显示成功数量。</span></div></div>
+  </div>
+  <p class="muted" style="margin-top:14px">菜单长这样（示意图）：</p>
+  <div class="terminal">
+    <div class="bar"><i></i><i></i><i></i></div>
+    <div><span class="cmd">[1]</span> 请选择任务类型:</div>
+    <div>    1) 创建账号（注册 + 密码 + 2FA，产出待开通账户）</div>
+    <div>    2) 开通会员（从已创建账户中选择，完成支付开通）</div>
+    <div>  请选择 (1-2, 默认=1): <span class="sel">1</span></div>
+    <div><span class="cmd">[2]</span> 请选择注册数量:</div>
+    <div>    1) 1 个（测试用）  2) 5 个  3) 10 个  4) 自定义</div>
+    <div>  请选择 (1-4, 默认=1): <span class="sel">2</span></div>
+    <div><span class="cmd">[3]</span> 请选择 IP 切换模式:</div>
+    <div>    1) 自动（v2rayN + iKuai）  2) 手动（Pocket WiFi / 热点）</div>
+    <div>  请选择 (1-2, 默认=1): <span class="sel">1</span></div>
+    <div class="hint">  ╔═ 执行确认 ═╗</div>
+    <div class="hint">    任务类型: 创建账号    注册数量: 5 个    IP 模式: 自动 (iKuai)</div>
+    <div>  确认执行？(Y/n): <span class="sel">Y</span></div>
+  </div>
+  <p class="caption">示意图：实际窗口为黑色背景，内容以运行时显示为准。</p>
+</section>
+
+<section id="s7">
+  <h2><span class="no">07</span>结果在哪里看</h2>
+  <p>结果按「两段式」管理，分两个文件，都在 <b>accounts</b> 文件夹里：</p>
+  <div class="flow">
+    <div class="node"><b>创建账号成功</b><span>写入 accounts_pending.txt（待开通）</span></div>
+    <div class="arrow">→</div>
+    <div class="node"><b>开通会员完成</b><span>移入 results.txt（最终结果）</span></div>
+    <div class="arrow">→</div>
+    <div class="node"><b>失败账号</b><span>连续模式移入 accounts_skipped.txt，原因见错误报告</span></div>
+  </div>
+  <p><b>accounts_pending.txt</b>（创建账号成功后生成）：每行一个账号，4 段 <code>----</code> 分隔：</p>
+  <pre class="code">帐号----密码----2FA----邮箱密码
+account@example.com----示例密码----https://2fa.run/2fa/示例TOTP----示例邮箱密码</pre>
+  <table>
+    <tr><th>列</th><th>用途</th></tr>
+    <tr><td>帐号</td><td>ChatGPT 登录邮箱</td></tr>
+    <tr><td>密码</td><td>ChatGPT 登录密码</td></tr>
+    <tr><td>2FA</td><td>浏览器打开这个链接，即可看到当前 6 位动态验证码（登录第二步用）</td></tr>
+    <tr><td>邮箱密码</td><td>该 Outlook 邮箱的密码（收验证码用）</td></tr>
+  </table>
+  <p>登录 ChatGPT 时：输入邮箱 + 密码，第二步打开 2FA 链接填入动态码即可。</p>
+  <p><b>accounts_skipped.txt</b>（连续执行模式下生成）：保存被自动跳过的邮箱原始行。
+  它不是黑名单；确认邮箱可以再次使用后，把对应行复制回 <b>input/email.txt</b>，
+  下一批次就会重新执行。每个批次结束还会在 <b>runtime/reports</b> 生成错误报告，
+  说明每个失败账户的原因和建议处理方式。</p>
+  <p class="muted">以下为真实运行时的「双重验证绑定成功」画面示例：</p>
+  <div class="shot">
+    <img src="assets/2fa-success.png" alt="2FA 绑定成功画面">
+    <div class="cap">设置 → 安全与登录：Authenticator 开关已开启（蓝色），说明双重验证绑定成功。</div>
+  </div>
+</section>
+
+<section id="s8">
+  <h2><span class="no">08</span>常见问题</h2>
+  <h3>双击 start.bat 没反应 / 一闪而过</h3>
+  <p>先运行一次 <code>install.bat</code> 确保环境装好；仍不行请把 <b>logs</b> 文件夹打包发给技术人员。</p>
+  <h3>提示「Xray 启动失败」或「找不到 xray.exe」</h3>
+  <p>检查 .env 里的 <code>XRAY_BASE_DIR</code> 是否是你电脑上 v2rayN 的实际路径，并确认该目录下存在 <code>bin\xray\xray.exe</code>。路径中不要有中文或空格。</p>
+  <h3>提示 iKuai 连接失败 / 线路找不到</h3>
+  <p>确认 .env 里的 <code>IKUAI_API_URL</code>、<code>IKUAI_USERNAME</code>、<code>IKUAI_PASSWORD</code> 正确；确认 <code>IKUAI_TARGET_WAN_NAME</code> 与 iKuai 管理后台显示的外网线路名称完全一致（含大小写）。</p>
+  <h3>杀毒软件报警</h3>
+  <p>工具会打开真实浏览器、读取邮箱验证码、启动 xray.exe，部分杀毒软件可能误报。请把项目文件夹加入信任区，或咨询技术人员。</p>
+  <h3>创建账号失败 / 报错</h3>
+  <p>检查网络；检查 input 里的邮箱是否足够、格式是否正确；把窗口里的报错截图发给技术人员。</p>
+  <h3>提示「input 数据仍为示例或缺失」</h3>
+  <p>说明 input 文件夹里的 email.txt / cards.csv 还没替换成真实数据（或文件被删了）。替换后再运行。</p>
+  <h3>手动模式下听不到提示音 / 程序不继续</h3>
+  <p>确认已切换网络（Pocket WiFi 或手机热点重连），程序每 10 秒自动检测出口 IP，检测到变化后自动继续；长时间不继续请把日志发给技术人员。</p>
+</section>
+
+<section id="s9">
+  <h2><span class="no">09</span>安全提醒</h2>
+  <div class="alert">
+    <b>accounts 文件夹、.env 文件里有真实账号密码和配置</b>，请妥善保管：不要发给别人、不要上传网盘或聊天工具。<br>
+    不要删除 <code>runtime</code>、<code>profiles</code>、<code>input</code>、<code>accounts</code> 文件夹，否则账号数据和配置会丢失。<br>
+    需要清理临时文件时，删除 <code>TMP</code> 文件夹里的内容即可（不影响任何数据）。
+  </div>
+</section>
+
+<section>
+<h2>浏览器后端（Firefox 隐私模式）</h2>
+<p>
+当前版本只使用「CloakBrowser」（现有 Chromium + 持久 profile）。
+「Firefox 隐私模式」仍在开发中，batch 启动器的浏览器选择菜单中已标注
+「开发中，暂不可选」，请勿选择 Firefox；请一直使用 CloakBrowser。
+后续版本完成 Firefox 真实验收后，会在菜单中重新开放该选项。
+</p>
+</section>
+
+<footer>
+  ChatGPT Auto-Registration v0.2.9 · 创建账号与开通会员可用；Firefox 后端开发中 · 交付日期 2026-09-03
+</footer>
+</div>
+</body>
+</html>

@@ -1,0 +1,2695 @@
+"""Batch, resource, network, and result coordination around one workflow."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import logging
+import os
+import random
+import re
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Set
+
+if TYPE_CHECKING:
+    from gpt_automation.browser.ip_guard import BrowserAcquireResult
+
+import config
+from gpt_automation.utils.csv_writer import (
+    ensure_dirs, ensure_output_csv,
+)
+from gpt_automation.utils.input_manager import InputManager, ResourceReport
+from gpt_automation.utils.redaction import mask_email
+from gpt_automation.phases.interactive import QuitBatchException
+from gpt_automation.utils.exceptions import FATAL_EXCEPTIONS, SkipEmailException
+from gpt_automation.network.strategy import (
+    NetworkStrategy,
+    create_network_strategy,
+)
+
+
+_SENSITIVE_DIGITS = re.compile(r"\d{12,}")
+
+
+def _redact_text(value: str) -> str:
+    """Mask long numeric secrets (card numbers etc.) in operator-facing text."""
+    return _SENSITIVE_DIGITS.sub("[REDACTED]", value)
+from gpt_automation.state import (
+    ActionState,
+    ResourceState,
+    SessionExecutionLock,
+    StateStore,
+    StateTransitionError,
+)
+from gpt_automation.security.password_generator import generate_chatgpt_password
+from gpt_automation.security.credential_store import (
+    CredentialStore,
+    CredentialStoreError,
+)
+from gpt_automation.workflow.engine import RegistrationWorkflow
+from gpt_automation.workflow.finalization import FinalizationCoordinator
+from gpt_automation.workflow.interaction_policy import (
+    AssistedPolicy,
+    ContinueOnBlockedPolicy,
+    InteractionPolicy,
+    UnattendedPolicy,
+)
+from gpt_automation.workflow.models import (
+    AccountRunResult,
+    AccountStatus,
+    RegistrationInput,
+    WorkflowStage,
+)
+
+# Windows terminals commonly default to cp932, which cannot render the
+# operator prompts. Reconfigure only real streams; test doubles may not expose
+# ``reconfigure``.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8")
+
+
+def _cloak_diagnostic_fields() -> dict:
+    """Read-only CloakBrowser runtime metadata for batch error reports."""
+    try:
+        from gpt_automation.browser.engine import inspect_cloakbrowser_runtime
+
+        report = inspect_cloakbrowser_runtime()
+    except Exception:  # noqa: BLE001 - diagnostics must never break the batch
+        return {}
+    fields: dict = {"browser_backend": "cloak"}
+    if report.binary_tier:
+        fields["binary_tier"] = report.binary_tier
+    if report.license_configured is not None:
+        fields["license_configured"] = report.license_configured
+    return fields
+
+
+class BatchEndReason:
+    """Stable batch termination labels used by summaries and exit handling."""
+    COMPLETED = "completed"
+    RESOURCE_DEPLETED = "resource_depleted"
+    MANUAL_CANCELLED = "manual_cancelled"
+    INITIAL_IP_FAILED = "initial_ip_failed"
+    BETWEEN_ACCOUNT_IP_FAILED = "between_account_ip_failed"
+    INPUT_UNAVAILABLE = "input_unavailable"
+    INTERRUPTED = "interrupted"
+    OPERATOR_REQUIRED = "operator_required"
+    BROWSER_CLOSE_FAILED = "browser_close_failed"
+
+
+# Repeated browser teardown failures mean leaked processes (e.g. Firefox)
+# will accumulate.  Stop allocating new accounts instead of continuing to
+# leak; the operator must inspect and kill the residual processes.
+MAX_BROWSER_CLOSE_FAILURES = 3
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RuntimeOptions:
+    """Per-run overrides supplied by a control surface.
+
+    The command-line entrypoint still uses environment/config defaults.  A
+    dashboard may pass only these allow-listed, non-secret values without
+    modifying ``.env`` or creating a second workflow.
+    """
+
+    auto_mode: Optional[bool] = None
+    rotation_mode: Optional[str] = None
+    max_accounts: Optional[int] = None
+    state_db_path: Optional[str] = None
+    input_dir: Optional[str] = None
+    execution_lock_dir: Optional[str] = None
+    interaction_policy: Optional[InteractionPolicy] = None
+    interaction_mode: Optional[str] = None
+    stop_event: Optional[object] = None
+    run_scope: Optional[str] = None
+    account_ids: Optional[tuple[str, ...]] = None
+    checkout_goal: Optional[str] = None
+    signup_method: Optional[str] = None
+    browser_backend: Optional[str] = None
+    # Optional async callback ``(prompt, keys) -> choice`` used by the manual
+    # hotspot strategy when the control surface answers IP prompts from the
+    # browser instead of stdin (dashboard runs).
+    network_confirmer: Optional[Any] = None
+    # Optional sync callback ``(kind, detail)`` for control-plane milestones
+    # (cloak preflight, network wait, resource acquisition, browser launch).
+    status_callback: Optional[Callable[[str, Any], None]] = None
+
+
+def runtime_options_from_env(env: dict) -> RuntimeOptions:
+    """Build RuntimeOptions from launcher-style environment variables.
+
+    ``RUN_SCOPE`` selects the task (account_provision / checkout_fulfillment /
+    full, default full); ``ACCOUNT_IDS`` is a comma-separated list used by
+    checkout_fulfillment to choose the READY accounts to activate.
+    """
+    scope = (env.get("RUN_SCOPE") or "").strip().lower() or None
+    checkout_goal = (env.get("CHECKOUT_GOAL") or "").strip().lower() or None
+    signup_method = (env.get("SIGNUP_METHOD") or "").strip().lower() or None
+    account_ids = None
+    raw_ids = (env.get("ACCOUNT_IDS") or "").strip()
+    if raw_ids:
+        account_ids = tuple(part.strip() for part in raw_ids.split(",") if part.strip())
+    browser_backend = (env.get("BROWSER_BACKEND") or "").strip().lower() or None
+    interaction_mode = (env.get("INTERACTION_MODE") or "").strip().lower() or None
+    return RuntimeOptions(
+        run_scope=scope,
+        account_ids=account_ids,
+        checkout_goal=checkout_goal,
+        signup_method=signup_method,
+        browser_backend=browser_backend,
+        interaction_mode=interaction_mode,
+    )
+
+
+SIGNUP_METHOD_NOT_ALLOWED_FOR_SCOPE = "SIGNUP_METHOD_NOT_ALLOWED_FOR_SCOPE"
+ALLOWED_SIGNUP_METHODS = ("password_2fa", "email_code")
+
+
+def _normalize_signup_method(raw: Optional[str]) -> str:
+    """Coerce a signup method; missing or unknown values keep the safe
+    historical default password_2fa."""
+    value = (raw or "").strip().lower()
+    return value if value in ALLOWED_SIGNUP_METHODS else "password_2fa"
+
+
+def validate_signup_method_scope(
+    signup_method: str,
+    run_scope: str,
+) -> None:
+    """Raise ValueError(SIGNUP_METHOD_NOT_ALLOWED_FOR_SCOPE) when the
+    signup method is not authorized for the task scope.
+
+    email_code only applies to account_provision; checkout_fulfillment and
+    the advanced full scope never create new credentials."""
+    method = _normalize_signup_method(signup_method)
+    scope = (run_scope or "account_provision").strip().lower()
+    if method == "email_code" and scope != "account_provision":
+        raise ValueError(
+            f"{SIGNUP_METHOD_NOT_ALLOWED_FOR_SCOPE}: signup_method email_code "
+            f"is not allowed for scope {scope!r} (allowed: account_provision)"
+        )
+
+
+def _signup_method_from_evidence(
+    state_store: "StateStore",
+    session_id: str,
+) -> Optional[str]:
+    """Recover the signup method recorded on a durable session.
+
+    The account flow persists the choice inside the NETWORK_READY evidence
+    before any signup action, so a resumed email-code session never falls
+    back to password creation just because the current env default is
+    password_2fa.  Legacy sessions without the detail stay None."""
+    evidence = state_store.get_step_evidence(session_id, "NETWORK_READY")
+    if evidence is None:
+        return None
+    recorded = dict(evidence.details).get("signup_method")
+    return recorded if recorded in ALLOWED_SIGNUP_METHODS else None
+
+
+SAMPLE_CHECKOUT_EMAILS = frozenset({
+    "first@example.com",
+    "ok@example.com",
+    "account@example.com",
+    "account@example.com",
+})
+
+
+def checkout_pool_empty(inventory, pending_file: str | None = None) -> bool:
+    """True when no READY inventory accounts exist for checkout_fulfillment.
+
+    The registered_accounts inventory is the single source of truth for
+    checkout execution.  Pending accounts file candidates are filtered for
+    sample/placeholder rows; if the inventory has READY accounts, the pool is
+    not empty.
+    """
+    if inventory is not None and hasattr(inventory, "list_accounts"):
+        return not bool(inventory.list_accounts(statuses=("READY",)))
+    return True
+
+
+def resolve_checkout_targets(
+    inventory,
+    pending_file: str | None = None,
+    selected_account_ids: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    """Resolve target account IDs for checkout fulfillment.
+
+    When selected_account_ids is provided, it is returned directly.
+    Otherwise, falls back to all READY accounts in the registered inventory.
+    """
+    if selected_account_ids:
+        return tuple(selected_account_ids)
+    if inventory is not None and hasattr(inventory, "list_accounts"):
+        ready_accounts = inventory.list_accounts(statuses=("READY",))
+        return tuple(a.account_id for a in ready_accounts)
+    return ()
+
+
+def resource_report_ready_for_scope(
+    report: ResourceReport,
+    run_scope: str | None,
+    checkout_goal: str = "complete",
+) -> bool:
+    """Scope-aware readiness: provision needs email only, checkout needs cards."""
+    scope = (run_scope or "full").strip().lower()
+    if scope == "account_provision":
+        return report.email.available > 0
+    if scope == "checkout_fulfillment":
+        goal = (checkout_goal or "complete").strip().lower()
+        if goal == "pricing_page":
+            # The pricing-page verification goal never opens Stripe and never
+            # claims a card, and the accounts come from the READY inventory,
+            # not the email queue, so the batch must not require either.
+            return True
+        # complete: payment needs card inventory; the account identity comes
+        # from the READY inventory, never from input/email.txt.
+        return report.card.available > 0
+    return report.ready
+
+
+def handle_account_result_side_effects(
+    *,
+    state_store: StateStore,
+    credential_store: "CredentialStore",
+    session_id: str,
+    email: str,
+    result: AccountRunResult,
+    run_scope: str | None,
+    output_dir: str | Path | None = None,
+    account_id: str | None = None,
+):
+    """Promote inventory / update account status after one scoped run."""
+    from gpt_automation.inventory.service import RegisteredAccountService
+
+    scope = (run_scope or "full").strip().lower()
+    inventory = RegisteredAccountService(
+        state_store=state_store,
+        credential_store=credential_store,
+        output_dir=output_dir or config.OUTPUT_DIR,
+    )
+    if scope == "account_provision" and result.status is AccountStatus.ACCOUNT_READY:
+        from gpt_automation.results.pending_file import PendingAccountsFile
+
+        passwordless = bool(getattr(result, "passwordless", False))
+        view = inventory.promote_session_to_ready(
+            session_id=session_id,
+            email=email,
+            offer_status="TARGET_ELIGIBLE",
+            allow_passwordless=passwordless,
+        )
+        pending = PendingAccountsFile(config.PENDING_FILE)
+        if passwordless:
+            pending.append_passwordless(
+                email=view.email,
+                email_password=view.email_password,
+            )
+        else:
+            pending.append(
+                email=view.email,
+                chatgpt_password=view.chatgpt_password,
+                totp_secret=view.totp_secret,
+                email_password=view.email_password,
+            )
+        return view
+    if (
+        scope == "account_provision"
+        and result.status is AccountStatus.BUSINESS_REJECTED
+        and result.raw_status == "NO_TARGET_OFFER"
+        and getattr(result, "offer_result", None) == "NO_OFFER"
+    ):
+        # 账号（密码路径含 MFA）已真实创建，只是没有命中配置目标优惠：账号必须保留
+        # 进库存（READY + NO_TARGET_OFFER），但不得写入 pending，邮箱
+        # 由 _finalize_resource_leases 标记 CONSUMED，避免重复注册。
+        passwordless = bool(getattr(result, "passwordless", False))
+        return inventory.promote_session_to_ready(
+            session_id=session_id,
+            email=email,
+            offer_status="NO_TARGET_OFFER",
+            allow_passwordless=passwordless,
+        )
+    if scope == "checkout_fulfillment":
+        # The login gate plus the target-account identity proof ran inside
+        # the shared workflow; record the verified-at timestamp only when the
+        # run outcome proves the login gate was reached and passed.
+        raw_status = getattr(result, "raw_status", "")
+        if account_id and raw_status in {
+            "success",
+            "PRICING_PAGE_VERIFIED",
+            "NO_FREE_OFFER",
+            "NO_TARGET_OFFER",
+            "NON_ZERO_AMOUNT",
+            "CHECKOUT_NON_ZERO_AMOUNT",
+        }:
+            inventory.mark_login_verified(
+                account_id,
+                session_id=session_id,
+            )
+        if result.status is AccountStatus.SUCCESS:
+            if account_id:
+                inventory.mark_checkout_done(account_id, session_id=session_id)
+            view = inventory.get_account(account_id) if account_id else inventory.get_account_by_email(email)
+            from gpt_automation.results.final_file import FinalResultsFile
+            from gpt_automation.results.pending_file import PendingAccountsFile
+
+            cand = PendingAccountsFile(config.PENDING_FILE).get_candidate(email)
+            final_email = email or (view.email if view else "")
+            final_pwd = (cand.chatgpt_password if cand else "") or (view.chatgpt_password if view else "")
+            final_totp = (cand.totp_secret if cand else "") or (view.totp_secret if view else "")
+            final_email_pwd = (cand.email_password if cand else "") or (view.email_password if view else "")
+
+            final_ok = FinalResultsFile(config.OUTPUT_CSV).append(
+                email=final_email,
+                chatgpt_password=final_pwd,
+                totp_secret=final_totp,
+                email_password=final_email_pwd,
+            )
+            PendingAccountsFile(config.PENDING_FILE).remove(email=final_email)
+            return final_ok
+        if account_id:
+            if result.status is AccountStatus.VERIFICATION_COMPLETE:
+                # The checkout goal stopped at the pricing page: the account is
+                # intact and must remain selectable, with no offer marking.
+                return inventory.release_to_ready(
+                    account_id,
+                    session_id=session_id,
+                )
+            if result.status is AccountStatus.UNKNOWN_SIDE_EFFECT:
+                from gpt_automation.results.held_file import HeldAccountsFile
+                from gpt_automation.results.pending_file import PendingAccountsFile
+                view = inventory.get_account(account_id)
+                cand = PendingAccountsFile(config.PENDING_FILE).get_candidate(email)
+                held_email = email or (view.email if view else "")
+                held_pwd = (cand.chatgpt_password if cand else "") or (view.chatgpt_password if view else "")
+                held_totp = (cand.totp_secret if cand else "") or (view.totp_secret if view else "")
+                held_mail_pwd = (cand.email_password if cand else "") or (view.email_password if view else "")
+                try:
+                    HeldAccountsFile(config.HELD_FILE).append(
+                        email=held_email,
+                        chatgpt_password=held_pwd,
+                        totp_secret=held_totp,
+                        email_password=held_mail_pwd,
+                        hold_reason=result.raw_status or "UNKNOWN_SIDE_EFFECT",
+                        disposition="ISOLATE",
+                    )
+                    PendingAccountsFile(config.PENDING_FILE).remove(email=held_email)
+                except Exception:
+                    pass
+                return inventory.mark_quarantined(account_id, session_id=session_id)
+            if result.status is AccountStatus.NEEDS_OPERATOR or result.raw_status in {"LOGIN_UNVERIFIED", "LOGIN_FAILED"}:
+                from gpt_automation.results.held_file import HeldAccountsFile
+                from gpt_automation.results.pending_file import PendingAccountsFile
+                view = inventory.get_account(account_id)
+                cand = PendingAccountsFile(config.PENDING_FILE).get_candidate(email)
+                held_email = email or (view.email if view else "")
+                held_pwd = (cand.chatgpt_password if cand else "") or (view.chatgpt_password if view else "")
+                held_totp = (cand.totp_secret if cand else "") or (view.totp_secret if view else "")
+                held_mail_pwd = (cand.email_password if cand else "") or (view.email_password if view else "")
+                try:
+                    HeldAccountsFile(config.HELD_FILE).append(
+                        email=held_email,
+                        chatgpt_password=held_pwd,
+                        totp_secret=held_totp,
+                        email_password=held_mail_pwd,
+                        hold_reason=result.raw_status or "NEEDS_OPERATOR",
+                        disposition="REVIEW",
+                    )
+                    PendingAccountsFile(config.PENDING_FILE).remove(email=held_email)
+                except Exception:
+                    pass
+                return inventory.mark_needs_operator(account_id, session_id=session_id)
+            if (
+                result.status is AccountStatus.BUSINESS_REJECTED
+                and result.raw_status
+                in {
+                    "NO_FREE_OFFER",
+                    "NO_TARGET_OFFER",
+                    "NON_ZERO_AMOUNT",
+                    "CHECKOUT_NON_ZERO_AMOUNT",
+                }
+            ):
+                return inventory.release_to_ready(
+                    account_id,
+                    session_id=session_id,
+                    offer_mark_reason=result.raw_status,
+                )
+            if (
+                result.status is AccountStatus.BUSINESS_REJECTED
+                and result.raw_status == "SKIPPED"
+            ):
+                # 操作员跳过：账户完好且未提交支付，回到 READY 池可重试，
+                # 不落 PAID_ONLY 标记。
+                return inventory.release_to_ready(
+                    account_id,
+                    session_id=session_id,
+                )
+            # The checkout goal stopped at the pricing page: the account is
+            # intact and must remain selectable, with no offer marking.
+            return inventory.release_to_ready(
+                account_id,
+                session_id=session_id,
+            )
+        if result.status is AccountStatus.UNKNOWN_SIDE_EFFECT:
+            return inventory.mark_quarantined(account_id, session_id=session_id)
+        if result.status is AccountStatus.NEEDS_OPERATOR:
+            return inventory.mark_needs_operator(account_id, session_id=session_id)
+        if result.raw_status in {"LOGIN_UNVERIFIED", "LOGIN_FAILED"}:
+            return inventory.mark_needs_operator(account_id, session_id=session_id)
+        if (
+            result.status is AccountStatus.BUSINESS_REJECTED
+            and result.raw_status
+            in {
+                "NO_FREE_OFFER",
+                "NO_TARGET_OFFER",
+                "NON_ZERO_AMOUNT",
+                "CHECKOUT_NON_ZERO_AMOUNT",
+                "SKIPPED",
+            }
+        ):
+            # No payment was submitted and the account is intact; put it back
+            # into the READY pool so a later batch can retry it.  Business
+            # rejections that prove there is no free offer mark the account
+            # PAID_ONLY; default checkout pools then skip it until an operator
+            # resets the marker.
+            mark_reason = (
+                result.raw_status
+                if result.raw_status
+                in {
+                    "NO_FREE_OFFER",
+                    "NO_TARGET_OFFER",
+                    "NON_ZERO_AMOUNT",
+                    "CHECKOUT_NON_ZERO_AMOUNT",
+                }
+                else ""
+            )
+            return inventory.release_to_ready(
+                account_id,
+                session_id=session_id,
+                offer_mark_reason=mark_reason,
+            )
+    return None
+
+
+def _resource_gate_reason(report: ResourceReport) -> str:
+    """Distinguish true depletion from resources held for operator review."""
+    if report.ready:
+        return BatchEndReason.COMPLETED
+    unavailable = tuple(
+        resource
+        for resource in (report.email, report.card)
+        if resource.available == 0
+    )
+    if unavailable and all(resource.blocked > 0 for resource in unavailable):
+        return BatchEndReason.OPERATOR_REQUIRED
+    return BatchEndReason.RESOURCE_DEPLETED
+
+
+def _resource_unavailable_message(report: ResourceReport) -> str:
+    """Render redacted resource counts without collapsing every cause."""
+    details = [
+        f"可用邮箱 {report.email.available}/{report.email.total}",
+        f"可用信用卡 {report.card.available}/{report.card.total}",
+    ]
+    if report.email.reserved:
+        details.append(f"邮箱被未完成会话占用 {report.email.reserved}")
+    if report.card.reserved:
+        details.append(f"信用卡被未完成会话占用 {report.card.reserved}")
+    if report.email.quarantined:
+        details.append(f"邮箱待人工核验 {report.email.quarantined}")
+    if report.card.quarantined:
+        details.append(f"信用卡待人工核验 {report.card.quarantined}")
+    return "无法启动新批次：" + "；".join(details) + "。"
+
+
+def _resource_summary_lines(report: ResourceReport) -> list[str]:
+    """Render a batch summary without treating held resources as depleted."""
+    lines = [
+        f"  剩余可用邮箱: {report.email.available} 个",
+        f"  剩余可用信用卡: {report.card.available} 个",
+    ]
+    if report.email.reserved:
+        lines.append(f"  邮箱被未完成会话占用: {report.email.reserved} 个")
+    if report.card.reserved:
+        lines.append(f"  信用卡被未完成会话占用: {report.card.reserved} 个")
+    if report.email.quarantined:
+        lines.append(f"  邮箱待人工核验: {report.email.quarantined} 个")
+    if report.card.quarantined:
+        lines.append(f"  信用卡待人工核验: {report.card.quarantined} 个")
+    if report.email.available < 50:
+        lines.append("  ⚠️  当前可用邮箱不足 50 个")
+    if report.card.available < 50:
+        lines.append("  ⚠️  当前可用信用卡不足 50 个")
+    if not report.ready:
+        if _resource_gate_reason(report) == BatchEndReason.OPERATOR_REQUIRED:
+            lines.append("  ⚠️  新任务被未完成会话或待核验资源阻塞，请先人工处理")
+        else:
+            lines.append("  ❌ 至少一类资源确实不可用，请核对并补充输入源")
+    return lines
+
+
+def _recover_stale_unlocked_sessions(
+    state_store: StateStore,
+    *,
+    lock_dir: str | Path,
+    now: datetime | None = None,
+    grace_seconds: int = 300,
+) -> int:
+    """Mark old RUNNING sessions as operator work when no process owns them."""
+    current_time = now or datetime.now(timezone.utc)
+    recovered = 0
+    lock_root = Path(lock_dir)
+    for session in state_store.list_sessions():
+        if session.status != "RUNNING":
+            continue
+        try:
+            updated_at = datetime.fromisoformat(
+                session.updated_at.replace("Z", "+00:00")
+            )
+        except ValueError:
+            continue
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+        if (current_time - updated_at).total_seconds() < grace_seconds:
+            continue
+        lock = SessionExecutionLock(lock_root / f"{session.session_id}.lock")
+        if not lock.acquire():
+            continue
+        try:
+            # Re-read after acquiring the lock.  A concurrently active run
+            # may have refreshed the checkpoint after the initial snapshot.
+            current = state_store.get_session(session.session_id)
+            current_overview = next(
+                (
+                    item
+                    for item in state_store.list_sessions()
+                    if item.session_id == session.session_id
+                ),
+                None,
+            )
+            if (
+                current is None
+                or current_overview is None
+                or current.status != "RUNNING"
+            ):
+                continue
+            try:
+                current_updated_at = datetime.fromisoformat(
+                    current_overview.updated_at.replace("Z", "+00:00")
+                )
+            except ValueError:
+                continue
+            if current_updated_at.tzinfo is None:
+                current_updated_at = current_updated_at.replace(tzinfo=timezone.utc)
+            if (current_time - current_updated_at).total_seconds() < grace_seconds:
+                continue
+            recovered += state_store.recover_interrupted_sessions(session.session_id)
+        finally:
+            lock.release()
+    return recovered
+
+
+_PRECHECKOUT_STAGES = {
+    WorkflowStage.CREATED.value,
+    WorkflowStage.NETWORK_PENDING.value,
+    WorkflowStage.NETWORK_READY.value,
+    WorkflowStage.ACCOUNT_VERIFIED.value,
+    WorkflowStage.PASSWORD_PENDING.value,
+    WorkflowStage.PASSWORD_VERIFIED.value,
+    WorkflowStage.MFA_PENDING.value,
+    WorkflowStage.MFA_VERIFIED.value,
+    WorkflowStage.OFFER_VERIFIED.value,
+}
+
+
+def _release_precheckout_card_leases(
+    state_store: StateStore,
+    *,
+    lock_dir: str | Path,
+) -> int:
+    """Release legacy early card leases while preserving resumable sessions."""
+    released = 0
+    lock_root = Path(lock_dir)
+    for session in state_store.list_sessions():
+        if session.status != "NEEDS_OPERATOR":
+            continue
+        if session.stage not in _PRECHECKOUT_STAGES:
+            continue
+        lock = SessionExecutionLock(lock_root / f"{session.session_id}.lock")
+        if not lock.acquire():
+            continue
+        try:
+            current = state_store.get_session(session.session_id)
+            if current is None or current.status != "NEEDS_OPERATOR":
+                continue
+            if current.stage not in _PRECHECKOUT_STAGES:
+                continue
+            if state_store.get_action(session.session_id, "PAYMENT_SUBMIT") is not None:
+                continue
+            # Card details may already have been displayed or entered in the
+            # checkout form.  From that point on the card is single-use and
+            # must be isolated, even if payment has not been submitted yet.
+            if state_store.get_action(session.session_id, "CARD_PRESENTATION") is not None:
+                try:
+                    state_store.transition_session_resources(
+                        session.session_id,
+                        {"card": ResourceState.QUARANTINED},
+                        expected=ResourceState.RESERVED,
+                    )
+                    state_store.update_session(
+                        session.session_id,
+                        stage=current.stage,
+                        status="NEEDS_OPERATOR",
+                        last_error="CARD_QUARANTINED_AFTER_PRESENTATION",
+                    )
+                except StateTransitionError:
+                    pass
+                continue
+            if state_store.get_session_resource_fingerprint(session.session_id, "card") is None:
+                continue
+            try:
+                state_store.transition_session_resources(
+                    session.session_id,
+                    {"card": ResourceState.RELEASED},
+                    expected=ResourceState.RESERVED,
+                )
+            except StateTransitionError:
+                continue
+            state_store.update_session(
+                session.session_id,
+                stage=current.stage,
+                status="NEEDS_OPERATOR",
+                last_error="CARD_RELEASED_BEFORE_CHECKOUT",
+            )
+            released += 1
+        finally:
+            lock.release()
+    return released
+
+
+def _abandon_session_safely(
+    state_store: StateStore,
+    session_id: str,
+    *,
+    lock_dir: str | Path,
+) -> str:
+    """Abandon one operator-held session with independent resource outcomes."""
+    lock = SessionExecutionLock(Path(lock_dir) / f"{session_id}.lock")
+    if not lock.acquire():
+        raise StateTransitionError("session is active and cannot be abandoned")
+    try:
+        session = state_store.get_session(session_id)
+        if session is None:
+            raise StateTransitionError(f"unknown workflow session: {session_id}")
+        payment = state_store.get_action(session_id, "PAYMENT_SUBMIT")
+        card_presentation = state_store.get_action(session_id, "CARD_PRESENTATION")
+        if payment is None and card_presentation is not None:
+            email_state = ResourceState.CONSUMED
+            card_state = ResourceState.QUARANTINED
+        elif payment is None and session.stage in _PRECHECKOUT_STAGES:
+            email_state = (
+                ResourceState.RELEASED
+                if session.stage in {
+                    WorkflowStage.CREATED.value,
+                    WorkflowStage.NETWORK_PENDING.value,
+                    WorkflowStage.NETWORK_READY.value,
+                }
+                else ResourceState.CONSUMED
+            )
+            card_state = ResourceState.RELEASED
+        elif payment is not None and payment.state is ActionState.VERIFIED:
+            email_state = ResourceState.CONSUMED
+            card_state = ResourceState.CONSUMED
+        else:
+            email_state = ResourceState.QUARANTINED
+            card_state = ResourceState.QUARANTINED
+        state_store.abandon_session(
+            session_id,
+            {"email": email_state, "card": card_state},
+        )
+        return "ABANDONED"
+    finally:
+        lock.release()
+
+
+def _consume_credentials(session_id: str) -> bool:
+    """Retire encrypted credentials after a successful durable result write."""
+    try:
+        return CredentialStore(config.CREDENTIAL_STORE_DIR).consume(session_id)
+    except CredentialStoreError as exc:
+        logger.error("credential retirement failed for session %s: %s", session_id, exc)
+        return False
+
+
+def _is_safe_session_id(session_id: str) -> bool:
+    """Allow only opaque filename-safe IDs before constructing lock paths."""
+    return bool(session_id) and len(session_id) <= 128 and all(
+        character.isalnum() or character in "._-"
+        for character in session_id
+    )
+
+
+def _batch_exit_code(reason: str) -> int:
+    if reason in (BatchEndReason.COMPLETED, BatchEndReason.RESOURCE_DEPLETED):
+        return 0
+    if reason == BatchEndReason.OPERATOR_REQUIRED:
+        return 2
+    return 1
+
+
+def _operator_result_for_exception(
+    email: str,
+    exc: BaseException,
+    *,
+    ip: Optional[str] = None,
+) -> AccountRunResult:
+    """Convert an unexpected workflow error without persisting its message."""
+    return AccountRunResult.for_code(
+        email=email,
+        code="NEEDS_OPERATOR",
+        ip=ip,
+        reason=type(exc).__name__,
+    )
+
+
+def _recover_ip_for_session(
+    state_store: StateStore,
+    session_id: str,
+) -> Optional[str]:
+    """Recover the browser-verified IP from NETWORK_READY evidence.
+
+    The batch uses the IP actually used by an account as the next account's
+    switch baseline.  An operator skip or an unexpected error must never lose
+    that value: the workflow persists ``observed_ip`` in the NETWORK_READY
+    evidence the moment the browser's exit IP is confirmed.
+    """
+    if not session_id:
+        return None
+    try:
+        evidence = state_store.get_step_evidence(session_id, "NETWORK_READY")
+    except Exception:  # noqa: BLE001 - recovery is best-effort
+        return None
+    if evidence is None:
+        return None
+    details = dict(evidence.details)
+    ip = details.get("observed_ip")
+    return ip if isinstance(ip, str) and ip else None
+
+
+def _settle_session_status(
+    state_store: StateStore,
+    session_id: str,
+    result: AccountRunResult,
+) -> None:
+    """Settle the session row so a finished account never stays RUNNING.
+
+    Success and ACCOUNT_READY paths are settled by FinalizationCoordinator
+    and the inventory promotion; operator-review states (NEEDS_OPERATOR,
+    UNKNOWN_SIDE_EFFECT) must stay visible for the recovery catalog.  Every
+    other terminal result (SKIPPED, business-rejected, error) is written back
+    so ``--list-resumable`` never offers a settled account as resumable.
+    """
+    keep_for_review = {
+        "NEEDS_OPERATOR",
+        "UNKNOWN_SIDE_EFFECT",
+        "IP_NOT_ROTATED",  # nothing started; the batch already decided
+    }
+    if result.raw_status in keep_for_review:
+        return
+    current = state_store.get_session(session_id)
+    if current is None or current.status != "RUNNING":
+        return
+    status = (
+        result.raw_status
+        if len(result.raw_status) <= 32
+        else result.status.value
+    )
+    state_store.update_session(
+        session_id,
+        stage=current.stage,
+        status=status,
+        last_error=result.reason,
+    )
+
+
+def _finalize_resource_leases(
+    state_store: StateStore,
+    session_id: str,
+    result: AccountRunResult,
+) -> None:
+    """Apply the safest reusable/consumed disposition for an account result."""
+    if result.status is AccountStatus.NEEDS_OPERATOR:
+        payment = state_store.get_action(session_id, "PAYMENT_SUBMIT")
+        if payment is not None and str(getattr(payment.state, "value", payment.state)) == "REJECTED":
+            transitions = {
+                "card": ResourceState.QUARANTINED,
+            }
+            _apply_transitions(state_store, session_id, transitions)
+        return
+
+    if result.status is AccountStatus.ACCOUNT_READY:
+        # Provision success consumes the email only; cards are never claimed.
+        transitions = {"email": ResourceState.CONSUMED}
+        attached_transitions = {
+            resource_type: state
+            for resource_type, state in transitions.items()
+            if state_store.get_session_resource_fingerprint(
+                session_id,
+                resource_type,
+            )
+            is not None
+        }
+        if attached_transitions:
+            state_store.transition_session_resources(
+                session_id,
+                attached_transitions,
+                expected=(ResourceState.RESERVED, ResourceState.QUARANTINED),
+            )
+        return
+
+    if result.status is AccountStatus.SUCCESS:
+        # Successful results are finalized by FinalizationCoordinator, which
+        # owns result writing, credential retirement, and resource consumption
+        # as one crash-resumable transaction.  The batch layer must not repeat
+        # that transition on return from the workflow.
+        finalization = state_store.get_finalization(session_id)
+        if finalization is not None and getattr(
+            getattr(finalization, "status", None), "value", None
+        ) in {
+            "RESOURCES_CONSUMED",
+            "SESSION_COMPLETED",
+            "CLEANUP_PENDING",
+            "FINALIZED",
+        }:
+            return
+        # Compatibility for diagnostic callers that invoke this helper without
+        # constructing the production finalization coordinator.
+        transitions = {
+            "email": ResourceState.CONSUMED,
+            "card": ResourceState.CONSUMED,
+        }
+    elif result.status in {
+        AccountStatus.RETRYABLE_FAILURE,
+        AccountStatus.VERIFICATION_COMPLETE,
+    }:
+        transitions = {
+            "email": ResourceState.RELEASED,
+            "card": ResourceState.RELEASED,
+        }
+    elif result.status is AccountStatus.UNKNOWN_SIDE_EFFECT:
+        transitions = {
+            "email": ResourceState.QUARANTINED,
+            "card": ResourceState.QUARANTINED,
+        }
+    elif result.status is AccountStatus.BUSINESS_REJECTED:
+        payment = state_store.get_action(session_id, "PAYMENT_SUBMIT")
+        if payment is None:
+            if result.raw_status in {
+                "NO_FREE_OFFER",
+                "NO_TARGET_OFFER",
+                "NON_ZERO_AMOUNT",
+                "CHECKOUT_NON_ZERO_AMOUNT",
+                "SKIPPED",
+            }:
+                if (
+                    result.raw_status == "NO_TARGET_OFFER"
+                    and getattr(result, "offer_result", None) == "NO_OFFER"
+                ):
+                    # 创建账户段：账号已经真实创建（凭据已进库存），邮箱
+                    # 必须 CONSUMED，绝不能释放回可用池造成重复注册。
+                    transitions = {
+                        "email": ResourceState.CONSUMED,
+                        "card": ResourceState.RELEASED,
+                    }
+                    return _apply_transitions(
+                        state_store,
+                        session_id,
+                        transitions,
+                    )
+                # Side-effect-free rejection: no payment was submitted and the
+                # email account is intact, so it must remain reusable.
+                transitions = {
+                    "email": ResourceState.RELEASED,
+                    "card": ResourceState.RELEASED,
+                }
+            else:
+                # ACCOUNT_ALREADY_EXISTS: the email is bound to another
+                # ChatGPT account and cannot be used for a new registration.
+                transitions = {
+                    "email": ResourceState.CONSUMED,
+                    "card": ResourceState.RELEASED,
+                }
+        elif payment.state is ActionState.VERIFIED:
+            transitions = {
+                "email": ResourceState.CONSUMED,
+                "card": ResourceState.CONSUMED,
+            }
+        else:
+            transitions = {
+                "email": ResourceState.QUARANTINED,
+                "card": ResourceState.QUARANTINED,
+            }
+    else:
+        payment = state_store.get_action(session_id, "PAYMENT_SUBMIT")
+        if payment is not None and payment.state is ActionState.VERIFIED:
+            transitions = {
+                "email": ResourceState.CONSUMED,
+                "card": ResourceState.CONSUMED,
+            }
+        elif payment is not None:
+            transitions = {
+                "email": ResourceState.QUARANTINED,
+                "card": ResourceState.QUARANTINED,
+            }
+        else:
+            # A fatal result may occur after an external page action but before
+            # its journal entry is visible. Keep both resources isolated until
+            # an operator verifies the account state.
+            transitions = {
+                "email": ResourceState.QUARANTINED,
+                "card": ResourceState.QUARANTINED,
+            }
+
+    _apply_transitions(state_store, session_id, transitions)
+
+
+def _apply_transitions(
+    state_store: StateStore,
+    session_id: str,
+    transitions: dict[str, ResourceState],
+) -> None:
+    """Apply resource transitions for the session's attached leases only."""
+    attached_transitions = {
+        resource_type: state
+        for resource_type, state in transitions.items()
+        if state_store.get_session_resource_fingerprint(
+            session_id,
+            resource_type,
+        ) is not None
+    }
+    if attached_transitions:
+        state_store.transition_session_resources(
+            session_id,
+            attached_transitions,
+            expected=(ResourceState.RESERVED, ResourceState.QUARANTINED),
+        )
+
+
+def _archive_skipped_email(email_queue, email: str) -> None:
+    """Archive one SKIPPED email: skipped file first, then input removal.
+
+    归档顺序不可颠倒：先写 ``accounts_skipped.txt``（原始行安全落盘），再从
+    ``input/email.txt`` 移除，最后才由调用方把邮箱恢复为 ``RELEASED``。任何
+    文件操作失败都会抛出异常，由调用方转换为 ``SKIP_ARCHIVE_FAILED`` 保留
+    资源等待人工处理，绝不宣称 Skip 已完成。
+    """
+    raw_line = email_queue.find_raw_line(email)
+    if raw_line is not None:
+        email_queue.archive_skipped(raw_line)
+    email_queue.remove_from_input(email)
+
+
+@dataclass
+class _PendingArchive:
+    """A SKIPPED email whose archive was deferred to batch-end flush."""
+
+    email: str
+    session_id: str
+    raw_line: Optional[str] = None
+
+
+def _flush_pending_archive(
+    pending_archive: list[_PendingArchive],
+    email_queue,
+    state_store: StateStore,
+) -> list[str]:
+    """Batch-end retry of deferred skip archives; returns still-failed emails."""
+    failures: list[str] = []
+    for item in pending_archive:
+        try:
+            if item.raw_line is None:
+                raise RuntimeError("raw input line is no longer available")
+            email_queue.archive_skipped(item.raw_line)
+            email_queue.remove_from_input(item.email)
+            state_store.transition_session_resources(
+                item.session_id,
+                {"email": ResourceState.RELEASED},
+                expected=(ResourceState.RESERVED, ResourceState.QUARANTINED),
+            )
+        except Exception as exc:  # noqa: BLE001 - flush must not lose data
+            logger.error(
+                "skip archive flush failed for %s: %s",
+                mask_email(item.email),
+                type(exc).__name__,
+            )
+            failures.append(item.email)
+    return failures
+
+# Default Japanese names — sourced from config module (single source of truth)
+_DEFAULT_SURNAMES = config.JP_SURNAMES
+_DEFAULT_GIVEN = config.JP_GIVENS
+
+
+def _build_registration_input(
+    pair: Dict[str, str],
+    *,
+    generate_password: bool = True,
+) -> RegistrationInput:
+    """Build stable generated fields so a resumed session keeps its identity."""
+    seed_source = pair.get("session_id") or pair["email"]
+    seed = int.from_bytes(
+        hashlib.sha256(seed_source.encode("utf-8")).digest()[:8],
+        "big",
+    )
+    generator = random.Random(seed)
+    name = (
+        f"{generator.choice(_DEFAULT_SURNAMES)} "
+        f"{generator.choice(_DEFAULT_GIVEN)}"
+    )
+    age = str(generator.randint(20, 60))
+    return RegistrationInput.from_row(
+        [
+            pair["email"], pair["email_pwd"], name, age,
+            pair.get("card_no", ""),
+            pair.get("card_expiry", ""),
+            pair.get("card_cvc", ""),
+            pair["zip_code"], pair["pref"], pair["city"],
+            pair["addr1"], pair["addr2"],
+        ],
+        client_id=pair.get("client_id", ""),
+        refresh_token=pair.get("refresh_token", ""),
+        chatgpt_password=pair.get("chatgpt_password")
+        or (
+            generate_chatgpt_password(config.CHATGPT_PASSWORD_LENGTH)
+            if generate_password
+            else ""
+        ),
+        totp_secret=pair.get("totp_secret", ""),
+    )
+
+# ═══════════════════════════════════════════════════════════════
+# Resource management — single source of truth for cleanup
+# ═══════════════════════════════════════════════════════════════
+
+
+# ═══════════════════════════════════════════════════════════════
+# Top-level registration
+# ═══════════════════════════════════════════════════════════════
+
+
+async def process_single_registration(
+    registration: RegistrationInput,
+    network_strategy: NetworkStrategy,
+    previous_ip: Optional[str] = None,
+    used_ips: Optional[Set[str]] = None,
+    interaction_policy: Optional[InteractionPolicy] = None,
+    state_store: Optional[StateStore] = None,
+    session_id: str = "",
+    card_resource_provider=None,
+    run_scope: Optional[str] = None,
+    require_login_gate: bool = False,
+    checkout_goal: str = "complete",
+    signup_method: Optional[str] = None,
+) -> AccountRunResult:
+    """Run one account through the canonical typed workflow."""
+    workflow = RegistrationWorkflow(interaction_policy=interaction_policy)
+    if (
+        state_store is not None
+        and session_id
+        and (run_scope or "full") == "full"
+    ):
+        workflow.set_finalization_coordinator(
+            FinalizationCoordinator(
+                state_store,
+                credential_consumer=_consume_credentials,
+            )
+        )
+    result = await workflow.run(
+        registration,
+        network_strategy=network_strategy,
+        previous_ip=previous_ip,
+        used_ips=used_ips,
+        state_store=state_store,
+        session_id=session_id,
+        card_resource_provider=card_resource_provider,
+        run_scope=run_scope or "full",
+        require_login_gate=require_login_gate,
+        checkout_goal=checkout_goal,
+        signup_method=signup_method,
+    )
+    return result
+
+
+class _StatusReportingNetworkStrategy:
+    """Proxy that reports CloakBrowser launch milestones to a control plane.
+
+    The wrapper keeps the shared ``NetworkStrategy`` lifecycle intact while
+    emitting ``browser_launching`` / ``browser_opened`` / ``browser_launch_failed``
+    around the only browser-acquisition call.  CLI runs simply skip the proxy.
+    """
+
+    def __init__(self, inner: NetworkStrategy, emit: Callable[[str, Any], None]) -> None:
+        self._inner = inner
+        self._emit = emit
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    async def acquire_browser(
+        self,
+        previous_ip: Optional[str],
+        used_ips: Set[str],
+        profile_id: str,
+    ) -> "BrowserAcquireResult":
+        from gpt_automation.browser.ip_guard import BrowserAcquireResult
+
+        self._emit("browser_launching")
+        try:
+            acquired = await self._inner.acquire_browser(
+                previous_ip,
+                used_ips,
+                profile_id,
+            )
+        except BaseException:
+            self._emit("browser_launch_failed")
+            raise
+        if acquired.browser is None:
+            self._emit("browser_launch_failed")
+        else:
+            self._emit("browser_opened")
+        return acquired
+
+
+# ═══════════════════════════════════════════════════════════════
+# Batch entry point
+# ═══════════════════════════════════════════════════════════════
+
+
+def _should_wait_for_manual_ip_switch(
+    rotation_mode: str,
+    result_status: str,
+    count: int,
+    max_accounts: int,
+    resources_available: bool,
+) -> bool:
+    """Return whether the batch should request a manual IP switch.
+
+    A switch is only meaningful when another account can start.  The current
+    account's detected IP is kept as the last-used IP; the IP observed after
+    the operator switches the hotspot is deliberately not added to ``used_ips``
+    until the next account's browser guard validates and actually uses it.
+    """
+    if rotation_mode != "manual-hotspot":
+        return False
+    if result_status == "IP_NOT_ROTATED":
+        return False
+    if max_accounts > 0 and count >= max_accounts:
+        return False
+    return resources_available
+
+
+def _should_stop_after_account_result(
+    result: AccountRunResult,
+    interaction_mode: str = "assisted",
+) -> bool:
+    """Hold the batch when the current account needs an operator decision.
+
+    连续执行模式（``continue_on_blocked``）下，普通阻塞已在调度层统一转成
+    ``SKIPPED``；残留的 ``NEEDS_OPERATOR`` 只可能是归档失败等真正需要人工
+    处理的场景，仍应停止。``UNKNOWN_SIDE_EFFECT`` 的资源已被隔离，不占用
+    下一账户的资源，因此允许批次继续处理其他账户。
+    """
+    if result.raw_status == "SKIP_ARCHIVE_FAILED":
+        # 延迟归档：文件层错误不停止批次，批次结束统一 flush。
+        return False
+    if result.status is AccountStatus.NEEDS_OPERATOR:
+        return True
+    if result.status is AccountStatus.UNKNOWN_SIDE_EFFECT:
+        return interaction_mode != "continue_on_blocked"
+    return False
+
+
+async def main(
+    resume_session_id: Optional[str] = None,
+    *,
+    runtime_options: Optional[RuntimeOptions] = None,
+) -> int:
+    """Use InputManager to acquire email+card pairs and process registrations."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+    if resume_session_id is not None and not _is_safe_session_id(resume_session_id):
+        logger.error("拒绝不安全的 session ID：%r", resume_session_id)
+        return 2
+
+    options = runtime_options or RuntimeOptions()
+    run_scope = (options.run_scope or "account_provision").strip().lower()
+    selected_account_ids = tuple(options.account_ids or ())
+    checkout_goal = (options.checkout_goal or "complete").strip().lower()
+    if checkout_goal not in {"complete", "pricing_page"}:
+        logger.error("unsupported checkout_goal: %s", checkout_goal)
+        return 1
+    # ── 非互動模式（AUTO_MODE）：無人值守時自動跳過失敗步驟 ──
+    auto_mode = (
+        options.auto_mode
+        if options.auto_mode is not None
+        else os.environ.get("AUTO_MODE", "").lower() in ("true", "1", "yes")
+    )
+    interaction_mode = (options.interaction_mode or "").strip().lower() or None
+    if interaction_mode not in {None, "assisted", "continue_on_blocked"}:
+        logger.error("unsupported INTERACTION_MODE: %s", interaction_mode)
+        return 1
+    if interaction_mode == "continue_on_blocked" and run_scope not in {"account_provision", "checkout_fulfillment"}:
+        logger.error(
+            "continue_on_blocked is only allowed for account_provision or checkout_fulfillment (got %s)",
+            run_scope,
+        )
+        return 1
+    interaction_policy: InteractionPolicy = (
+        options.interaction_policy
+        or (
+            ContinueOnBlockedPolicy()
+            if interaction_mode == "continue_on_blocked"
+            else (UnattendedPolicy() if auto_mode else AssistedPolicy())
+        )
+    )
+    # Unattended (continue_on_blocked) manual IP rotation never prompts and
+    # never reuses an IP; assisted mode keeps the operator-in-the-loop flow.
+    unattended = interaction_mode == "continue_on_blocked"
+    rotation_mode: str = options.rotation_mode or config.IP_ROTATION_CONFIG.get(
+        "rotation_mode", "ikuai-single"
+    )
+    if rotation_mode == "manual-hotspot" and auto_mode:
+        logger.error("manual-hotspot cannot run with AUTO_MODE")
+        return 1
+    # Automatic rotation depends on a locally installed Xray runtime and its
+    # v2rayN node data.  Fail before initializing state or leasing an email so
+    # a missing network dependency cannot leave a misleading session behind.
+    if rotation_mode != "manual-hotspot":
+        xray_executable = Path(config.XRAY_CONFIG.get("executable", ""))
+        xray_db = Path(config.XRAY_CONFIG.get("db_path", ""))
+        xray_config_dir = Path(config.XRAY_CONFIG.get("config_dir", ""))
+        if not xray_executable.is_file():
+            logger.error(
+                "network preflight failed: Xray executable not found: %s "
+                "(configured XRAY_BASE_DIR=%s)",
+                xray_executable,
+                config.XRAY_CONFIG.get("base_dir", ""),
+            )
+            return 1
+        if not xray_db.is_file() and not xray_config_dir.is_dir():
+            logger.error(
+                "network preflight failed: neither v2rayN DB nor JSON config "
+                "directory exists: db=%s config_dir=%s",
+                xray_db,
+                xray_config_dir,
+            )
+            return 1
+    from gpt_automation.browser.engine import (
+        ensure_cloakbrowser_latest,
+        prepare_cloakbrowser_binary,
+    )
+    from gpt_automation.browser.provider import (
+        create_browser_provider,
+        normalize_backend,
+    )
+    from gpt_automation.browser.backend_policy import (
+        validate_checkout_goal_backend,
+        validate_scope_backend,
+    )
+    from gpt_automation.browser.models import BackendAvailability
+    browser_backend = normalize_backend(
+        options.browser_backend or os.environ.get("BROWSER_BACKEND") or "cloak"
+    ).value
+    # 非法 scope+backend 组合必须在预检、等 IP、租资源、建 session 之前拒绝。
+    try:
+        validate_scope_backend(run_scope, browser_backend)
+    except ValueError as exc:
+        logger.error("%s", exc)
+        return 1
+    # Firefox complete checkout remains release-locked until the real,
+    # payment-controlled acceptance run has passed.  Keep this gate before
+    # any directory, network, resource, or session side effect.
+    try:
+        validate_checkout_goal_backend(run_scope, checkout_goal, browser_backend)
+    except ValueError as exc:
+        logger.error("%s", exc)
+        return 1
+    signup_method = _normalize_signup_method(
+        options.signup_method or os.environ.get("SIGNUP_METHOD")
+    )
+    # 邮箱验证码创建方式只允许 account_provision；非法组合必须在预检、
+    # 等 IP、租资源、建 session 之前拒绝。
+    try:
+        validate_signup_method_scope(signup_method, run_scope)
+    except ValueError as exc:
+        logger.error("%s", exc)
+        return 1
+    ensure_dirs()
+    ensure_output_csv()
+
+    def _emit(kind: str, detail: Any = None) -> None:
+        if options.status_callback is not None:
+            try:
+                options.status_callback(kind, detail)
+            except Exception:  # noqa: BLE001 — status must never break the run
+                logger.debug("status callback failed for %s", kind)
+
+    state_store = StateStore(options.state_db_path or config.STATE_DB_PATH)
+    state_store.initialize()
+    active_session_lock: Optional[SessionExecutionLock] = None
+
+    # SQLite is the production source of truth. Existing text usage files are
+    # imported once by InputManager and are not changed in this mode.
+    input_mgr = InputManager(
+        input_dir=options.input_dir or config.INPUT_DIR,
+        state_store=state_store,
+    )
+    from gpt_automation.inventory.email_queue import (
+        BatchEmailExclusion,
+        EmailQueue,
+    )
+
+    email_queue = EmailQueue(
+        input_path=os.path.join(options.input_dir or config.INPUT_DIR, "email.txt"),
+        skipped_path=config.SKIPPED_FILE,
+    )
+    pending_archive: list[_PendingArchive] = []
+    attempted_email_fingerprints = BatchEmailExclusion()
+    exclusion_hits = 0
+    from gpt_automation.reporting.batch_report import (
+        BatchOutcomeCategory,
+        BatchOutcomeEntry,
+        BatchRunReport,
+        RetryDisposition,
+        build_version,
+        classify_result,
+        disposition_for,
+        reason_text_for,
+        stage_label,
+        write_error_report,
+    )
+
+    batch_report = BatchRunReport(
+        batch_id=hashlib.sha256(
+            f"{datetime.now(timezone.utc).isoformat()}".encode("utf-8")
+        ).hexdigest()[:12],
+        run_scope=run_scope,
+        interaction_mode=interaction_mode or ("unattended" if auto_mode else "assisted"),
+        rotation_mode=rotation_mode,
+        started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        build=build_version(),
+    )
+    # 创建账户 Offer 验收报告条目收集（仅 account_provision 使用）
+    offer_items: list = []
+    # 开通会员 无免费会员验收报告条目收集（仅 checkout_fulfillment 使用）
+    checkout_offer_items: list = []
+    # 开通会员 卡片结算报告条目收集（仅 checkout_fulfillment 使用）
+    checkout_card_items: list = []
+    card_tracker = None
+    passed_cards_file = None
+    declined_cards_file = None
+    if run_scope == "checkout_fulfillment":
+        from gpt_automation.results.card_file import (
+            CardSourceTracker,
+            DeclinedCardsFile,
+            PassedCardsFile,
+        )
+
+        card_tracker = CardSourceTracker(config.CARDS_FILE)
+        passed_cards_file = PassedCardsFile(config.CARDS_PASSED_FILE)
+        declined_cards_file = DeclinedCardsFile(config.CARDS_DECLINED_FILE)
+
+    resume_pair: Optional[Dict[str, str]] = None
+    if resume_session_id:
+        active_session_lock = SessionExecutionLock(
+            os.path.join(
+                options.execution_lock_dir or config.EXECUTION_LOCK_DIR,
+                f"{resume_session_id}.lock",
+            )
+        )
+        if not active_session_lock.acquire():
+            logger.error("session %s 正由其他进程执行，拒绝重复恢复。", resume_session_id)
+            return 2
+        state_store.recover_interrupted_sessions(resume_session_id)
+        resume_card = input_mgr.load_card_for_session(resume_session_id)
+        session_record = state_store.get_session(resume_session_id)
+        if session_record is None:
+            logger.error(
+                "无法恢复 session %s：会话记录不存在。",
+                resume_session_id,
+            )
+            active_session_lock.release()
+            active_session_lock = None
+            return 1
+        # Resume always uses the browser backend recorded on the session;
+        # the current menu/env selection must not change the session backend.
+        browser_backend = normalize_backend(session_record.browser_backend).value
+        scope_row = state_store.get_session_scope(resume_session_id)
+        resume_scope = scope_row[0] if scope_row is not None else None
+        # Resume keeps the signup method recorded on the session so an
+        # email-code session is never re-routed into password creation
+        # just because the current env default is password_2fa.
+        recorded_signup_method = _signup_method_from_evidence(
+            state_store,
+            resume_session_id,
+        )
+        if recorded_signup_method is not None:
+            signup_method = recorded_signup_method
+        resume_email: Optional[Dict[str, str]] = None
+        if resume_scope == "checkout_fulfillment":
+            # Checkout sessions do not lease the source email queue; the
+            # account identity and credentials live in the registered-account
+            # inventory (encrypted).  Rebuild the pair from there so Firefox
+            # resumption works without any queue lease.
+            from gpt_automation.inventory.service import RegisteredAccountService
+            from gpt_automation.security.credential_store import CredentialStore
+
+            inventory = RegisteredAccountService(
+                state_store=state_store,
+                credential_store=CredentialStore(config.CREDENTIAL_STORE_DIR),
+                output_dir=config.OUTPUT_DIR,
+            )
+            account_id = scope_row[1] if scope_row is not None else None
+            account_view = (
+                inventory.get_account(account_id) if account_id is not None else None
+            )
+            if account_view is not None:
+                resume_email = {
+                    "session_id": resume_session_id,
+                    "email": account_view.email,
+                    "email_pwd": account_view.email_password,
+                    "client_id": account_view.client_id,
+                    "refresh_token": account_view.refresh_token,
+                    "chatgpt_password": account_view.chatgpt_password,
+                    "totp_secret": account_view.totp_secret,
+                    **input_mgr._get_random_address(resume_session_id),
+                }
+        else:
+            resume_email = input_mgr.load_email_for_session(resume_session_id)
+        if resume_email is None:
+            logger.error(
+                "无法恢复 session %s：租约或账户凭据不存在。",
+                resume_session_id,
+            )
+            active_session_lock.release()
+            active_session_lock = None
+            return 1
+        if resume_card is None and session_record.stage not in _PRECHECKOUT_STAGES:
+            logger.error(
+                "无法恢复 session %s：已进入需要信用卡的阶段，但卡片租约不存在。",
+                resume_session_id,
+            )
+            active_session_lock.release()
+            active_session_lock = None
+            return 1
+        resume_pair = {**resume_email, **(resume_card or {})}
+        logger.warning(
+            "正在恢复 session %s；程序会重新检测页面，关键动作不会盲目重放。",
+            resume_session_id,
+        )
+    else:
+        recovered_count = _recover_stale_unlocked_sessions(
+            state_store,
+            lock_dir=options.execution_lock_dir or config.EXECUTION_LOCK_DIR,
+        )
+        if recovered_count:
+            logger.warning(
+                "检测到 %d 个无活动进程的中断会话，已转为 NEEDS_OPERATOR；"
+                "其资源继续保留，禁止自动重复分配。",
+                recovered_count,
+            )
+        released_cards = _release_precheckout_card_leases(
+            state_store,
+            lock_dir=options.execution_lock_dir or config.EXECUTION_LOCK_DIR,
+        )
+        if released_cards:
+            logger.warning(
+                "已释放 %d 个 Checkout 前旧 session 的信用卡租约；邮箱和 session 继续保留。",
+                released_cards,
+            )
+        resumable_sessions = state_store.list_resumable_sessions()
+        for resumable in resumable_sessions:
+            logger.debug(
+                "存在未完成任务：session=%s stage=%s status=%s；"
+                "如需处理，请显式运行 python -m gpt_automation --resume %s",
+                resumable.session_id,
+                resumable.stage,
+                resumable.status,
+                resumable.session_id,
+            )
+        for finalization in state_store.list_pending_finalizations():
+            logger.warning(
+                "session=%s finalization=%s last_error=%s；如需处理，请先检查结算现场后再 resume",
+                finalization.session_id,
+                finalization.status.value,
+                finalization.last_error or "(none)",
+            )
+        resource_report = input_mgr.get_resource_report()
+        if not resource_report_ready_for_scope(
+            resource_report,
+            run_scope,
+            checkout_goal=checkout_goal,
+        ):
+            logger.warning(_resource_unavailable_message(resource_report))
+            return _batch_exit_code(_resource_gate_reason(resource_report))
+
+    previous_ip: Optional[str] = None
+    used_ips: Set[str] = set()
+    strict_mode: bool = config.IP_ROTATION_CONFIG.get("strict_mode", True)
+
+    # A crashed or aborted process must not forget which IP the last account
+    # actually used: recover the most recent browser-verified IP from durable
+    # NETWORK_READY evidence so the next account's IP switch still has a real
+    # baseline.  Resume runs keep their own session context and are skipped.
+    if resume_pair is None:
+        recovered_ip = state_store.get_latest_network_ip()
+        if recovered_ip:
+            previous_ip = recovered_ip
+            logger.info(
+                "batch: recovered last used IP from evidence: %s",
+                recovered_ip,
+            )
+
+    # Validate the browser runtime before checking resources.  ``start.bat``
+    # performs this in a separate bootstrap process and sets the marker so
+    # the child batch process does not run the same network update twice.
+    # Resume runs first so the preflight always matches the session backend.
+    preflight_done_backend = os.environ.get("BROWSER_PREFLIGHT_BACKEND", "").strip()
+    preflight_done = bool(preflight_done_backend) and (
+        preflight_done_backend == browser_backend
+        or (
+            preflight_done_backend == "cloak"
+            and os.environ.get("CLOAK_PREFLIGHT_DONE") == "1"
+        )
+    )
+    if preflight_done:
+        logger.info("browser preflight already completed by launcher (%s)", browser_backend)
+        _emit("cloak_preflight")
+        _emit("cloak_preflight_ok")
+    else:
+        _emit("cloak_preflight")
+        try:
+            if browser_backend == "firefox_private":
+                from gpt_automation.browser.firefox_private import (
+                    check_firefox_installed,
+                    verify_firefox_runtime,
+                )
+
+                firefox_ok, firefox_detail = check_firefox_installed()
+                if not firefox_ok:
+                    raise RuntimeError(firefox_detail)
+                runtime_ok, runtime_detail = await verify_firefox_runtime()
+                if not runtime_ok:
+                    raise RuntimeError(runtime_detail)
+            else:
+                ensure_cloakbrowser_latest()
+                prepare_cloakbrowser_binary(allow_update=True)
+            _emit("cloak_preflight_ok")
+        except Exception as exc:
+            logger.error(
+                "browser preflight failed before batch start (%s): %s",
+                browser_backend,
+                exc,
+            )
+            _emit("cloak_preflight_failed", _redact_text(str(exc))[:300])
+            return 1
+
+    browser_provider = create_browser_provider(browser_backend)
+    browser_backend_available = (
+        browser_provider.preflight().availability is BackendAvailability.AVAILABLE
+    )
+
+    if rotation_mode == "manual-hotspot" and options.network_confirmer is not None:
+        from gpt_automation.network.manual_ip import ManualIPSwitcher
+        from gpt_automation.network.strategy import ManualHotspotNetworkStrategy
+
+        network_strategy = ManualHotspotNetworkStrategy(
+            switcher=ManualIPSwitcher(
+                input_fn=options.network_confirmer,
+                unattended=unattended,
+            ),
+            browser_provider=browser_provider,
+        )
+    else:
+        network_strategy = create_network_strategy(
+            rotation_mode,
+            browser_provider=browser_provider,
+            unattended=unattended,
+        )
+    if options.status_callback is not None:
+        network_strategy = _StatusReportingNetworkStrategy(network_strategy, _emit)
+    max_accounts: int = (
+        options.max_accounts
+        if options.max_accounts is not None
+        else config.MAX_ACCOUNTS
+    )
+    count: int = 0
+    success_count: int = 0
+    fail_count: int = 0
+    browser_close_failures: int = 0
+
+    batch_end_reason = BatchEndReason.COMPLETED
+
+    try:
+        if rotation_mode == "manual-hotspot":
+            _emit("network_waiting")
+            initial_result = await network_strategy.prepare_batch()
+            if (
+                initial_result is None
+                or initial_result.status != "success"
+                or not initial_result.candidate_ip
+            ):
+                initial_status = (
+                    initial_result.status if initial_result is not None else "failed"
+                )
+                batch_end_reason = (
+                    BatchEndReason.MANUAL_CANCELLED
+                    if initial_status == "cancelled"
+                    else BatchEndReason.INPUT_UNAVAILABLE
+                    if initial_status == "input_unavailable"
+                    else BatchEndReason.INITIAL_IP_FAILED
+                )
+                return 1
+            # A direct first-account choice has no previous account IP.  When
+            # the operator explicitly switched, retain the old baseline so
+            # the browser guard still requires a different exit IP.  A
+            # recovered evidence baseline (from a crashed process) is kept
+            # when the operator did not switch explicitly.
+            previous_ip = initial_result.baseline_ip or previous_ip
+
+        while True:
+            if options.stop_event is not None and getattr(
+                options.stop_event, "is_set", lambda: False
+            )():
+                batch_end_reason = BatchEndReason.MANUAL_CANCELLED
+                logger.warning("收到控制台安全停止请求，在账户边界结束批次。")
+                break
+            # ── MAX_ACCOUNTS limit check ──
+            if max_accounts > 0 and count >= max_accounts:
+                logger.info("已达到最大注册数 %d，批次结束。", max_accounts)
+                break
+
+            is_resume = resume_pair is not None
+            active_account_id: Optional[str] = None
+            if resume_pair is not None:
+                pair = resume_pair
+                resume_pair = None
+                scope_row = state_store.get_session_scope(pair["session_id"])
+                if scope_row is not None:
+                    active_account_id = scope_row[1]
+            elif run_scope == "checkout_fulfillment":
+                from gpt_automation.inventory.service import RegisteredAccountService
+                from gpt_automation.security.credential_store import CredentialStore
+                from gpt_automation.results.pending_file import PendingAccountsFile
+
+                pending_handler = PendingAccountsFile(config.PENDING_FILE)
+                pending_candidates = pending_handler.list_candidates()
+                pending_cand_map = {c.email: c for c in pending_candidates}
+
+                inventory = RegisteredAccountService(
+                    state_store=state_store,
+                    credential_store=CredentialStore(config.CREDENTIAL_STORE_DIR),
+                    output_dir=config.OUTPUT_DIR,
+                )
+                if checkout_pool_empty(inventory, pending_file=config.PENDING_FILE):
+                    logger.error(
+                        "checkout_fulfillment: no READY accounts to activate; run account_provision first"
+                    )
+                    batch_end_reason = BatchEndReason.INPUT_UNAVAILABLE
+                    break
+                if not selected_account_ids:
+                    selected_account_ids = resolve_checkout_targets(
+                        inventory,
+                        pending_file=config.PENDING_FILE,
+                        selected_account_ids=(),
+                    )
+                if not selected_account_ids:
+                    logger.error("checkout_fulfillment requires account_ids")
+                    batch_end_reason = BatchEndReason.INPUT_UNAVAILABLE
+                    break
+                if count >= len(selected_account_ids):
+                    break
+                target_ident = selected_account_ids[count]
+                _emit("resource_acquiring")
+                from gpt_automation.inventory.checkout_handoff import (
+                    evaluate_checkout_handoff,
+                )
+
+                handoff = evaluate_checkout_handoff(
+                    state_store=state_store,
+                    credential_store=CredentialStore(config.CREDENTIAL_STORE_DIR),
+                    account_id=target_ident,
+                    target_backend=browser_backend,
+                    target_backend_ready=browser_backend_available,
+                )
+                if not handoff.eligible:
+                    logger.error(
+                        "checkout handoff blocked for %s: %s (%s)",
+                        target_ident,
+                        handoff.status.value,
+                        handoff.reason,
+                    )
+                    if interaction_mode == "continue_on_blocked":
+                        batch_report.add_entry(
+                            BatchOutcomeEntry(
+                                email=target_ident,
+                                session_id="",
+                                category=BatchOutcomeCategory.AUTO_SKIPPED,
+                                status="HANDOFF_BLOCKED",
+                                stage="HANDOFF_GATE",
+                                stage_label=stage_label("HANDOFF_GATE"),
+                                reason_text=f"checkout handoff blocked: {handoff.status.value} ({handoff.reason})",
+                                retry_disposition=RetryDisposition.MANUAL_REVIEW,
+                                finished_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                last_error="",
+                                resource_state="",
+                                in_input=False,
+                                in_skipped=False,
+                            )
+                        )
+                        fail_count += 1
+                        count += 1
+                        continue
+                    batch_end_reason = BatchEndReason.OPERATOR_REQUIRED
+                    break
+                cand = pending_cand_map.get(target_ident)
+                account_view = inventory.get_account(target_ident) or (inventory.get_account_by_email(cand.email) if cand else None)
+
+                target_email = cand.email if cand else (account_view.email if account_view else target_ident)
+                target_pwd = cand.chatgpt_password if cand else (account_view.chatgpt_password if account_view else "")
+                target_totp = cand.totp_secret if cand else (account_view.totp_secret if account_view else "")
+                target_email_pwd = cand.email_password if cand else (account_view.email_password if account_view else "")
+                target_client_id = account_view.client_id if account_view else ""
+                target_refresh_token = account_view.refresh_token if account_view else ""
+
+                # A new checkout run always opens a fresh durable session so
+                # the browser backend is recorded explicitly and no session
+                # created under another backend is ever reused.  Resuming an
+                # interrupted checkout keeps that session via --resume.
+                checkout_session_id = state_store.create_session_with_resources(
+                    target_email,
+                    {},
+                    browser_backend=browser_backend,
+                )
+                if account_view:
+                    try:
+                        reserved = inventory.reserve_accounts(
+                            session_id=checkout_session_id,
+                            account_ids=(account_view.account_id,),
+                        )
+                        account = reserved[0]
+                        active_account_id = account.account_id
+                        inventory.mark_checkout_running(
+                            account.account_id,
+                            session_id=checkout_session_id,
+                        )
+                    except Exception:
+                        active_account_id = account_view.account_id
+                else:
+                    active_account_id = None
+
+                session_id = checkout_session_id
+                state_store.update_session_scope(
+                    session_id,
+                    run_scope=run_scope,
+                    account_id=active_account_id,
+                )
+                pair = {
+                    "session_id": session_id,
+                    "email": target_email,
+                    "email_pwd": target_email_pwd,
+                    "client_id": target_client_id,
+                    "refresh_token": target_refresh_token,
+                    "chatgpt_password": target_pwd,
+                    "totp_secret": target_totp,
+                    **input_mgr._get_random_address(session_id),
+                }
+            else:
+                _emit("resource_acquiring")
+                pair = await input_mgr.acquire_email_session()
+                if pair is not None:
+                    if attempted_email_fingerprints.contains(pair["email"]):
+                        exclusion_hits += 1
+                        if exclusion_hits >= 3:
+                            logger.error(
+                                "batch: 同一邮箱连续 %d 次被选中但已在本批次处理过，"
+                                "邮箱队列未正确前移，停止批次",
+                                exclusion_hits,
+                            )
+                            state_store.transition_session_resources(
+                                pair["session_id"],
+                                {"email": ResourceState.RELEASED},
+                            )
+                            batch_end_reason = BatchEndReason.INPUT_UNAVAILABLE
+                            break
+                        logger.warning(
+                            "batch: %s already attempted in this batch, releasing and skipping",
+                            mask_email(pair["email"]),
+                        )
+                        state_store.transition_session_resources(
+                            pair["session_id"],
+                            {"email": ResourceState.RELEASED},
+                        )
+                        continue
+                    attempted_email_fingerprints.mark(pair["email"])
+                    exclusion_hits = 0
+                    state_store.set_session_backend(
+                        pair["session_id"],
+                        browser_backend,
+                    )
+                    state_store.update_session_scope(
+                        pair["session_id"],
+                        run_scope=run_scope,
+                        account_id=None,
+                    )
+            if pair is None:
+                resource_report = input_mgr.get_resource_report()
+                logger.info(_resource_unavailable_message(resource_report))
+                if batch_end_reason != BatchEndReason.OPERATOR_REQUIRED:
+                    batch_end_reason = _resource_gate_reason(resource_report)
+                break
+
+            count += 1
+
+            if active_session_lock is None:
+                active_session_lock = SessionExecutionLock(
+                    os.path.join(
+                        options.execution_lock_dir or config.EXECUTION_LOCK_DIR,
+                        f"{pair['session_id']}.lock",
+                    )
+                )
+                if not active_session_lock.acquire():
+                    logger.error(
+                        "session %s execution lock is unavailable; preserving it for operator review",
+                        pair["session_id"],
+                    )
+                    current_session = state_store.get_session(pair["session_id"])
+                    if current_session is not None:
+                        state_store.update_session(
+                            pair["session_id"],
+                            stage=current_session.stage,
+                            status="NEEDS_OPERATOR",
+                            last_error="SESSION_LOCK_UNAVAILABLE",
+                        )
+                    if is_resume:
+                        batch_end_reason = BatchEndReason.OPERATOR_REQUIRED
+                        break
+                    active_session_lock = None
+                    continue
+
+            registration = _build_registration_input(
+                pair,
+                generate_password=(signup_method != "email_code"),
+            )
+
+            async def acquire_card_for_checkout() -> Optional[Dict[str, str]]:
+                card_data = await input_mgr.acquire_card_for_session(pair["session_id"])
+                if card_data is not None:
+                    pair.update(card_data)
+                return card_data
+
+            # ── Steps 1-3: Start Xray + enable proxy + verify IP ──
+            preparation = await network_strategy.prepare_account(pair["email"])
+            if not preparation.ready:
+                logger.error(
+                    "Pipeline pre-flight failed for %s: %s, skipping",
+                    mask_email(pair["email"]), preparation.status,
+                )
+                # A failed automatic preparation may still have started Xray
+                # or enabled a proxy. Clean it before retrying another account.
+                await network_strategy.finish_account()
+                if is_resume:
+                    current_session = state_store.get_session(pair["session_id"])
+                    assert current_session is not None
+                    state_store.update_session(
+                        pair["session_id"],
+                        stage=current_session.stage,
+                        status="NEEDS_OPERATOR",
+                        last_error=f"PREFLIGHT:{preparation.status}",
+                    )
+                else:
+                    state_store.update_session(
+                        pair["session_id"],
+                        stage=WorkflowStage.NETWORK_PENDING.value,
+                        status="RETRYABLE_FAILURE",
+                        last_error=preparation.status,
+                    )
+                    _finalize_resource_leases(
+                        state_store,
+                        pair["session_id"],
+                        AccountRunResult.for_code(
+                            email=pair["email"],
+                            code="PREFLIGHT_FAILED",
+                        ),
+                    )
+                if strict_mode:
+                    logger.error("batch abort: strict_mode=True, terminating")
+                    batch_end_reason = (
+                        BatchEndReason.INITIAL_IP_FAILED
+                        if count == 1
+                        else BatchEndReason.BETWEEN_ACCOUNT_IP_FAILED
+                    )
+                    active_session_lock.release()
+                    active_session_lock = None
+                    break
+                active_session_lock.release()
+                active_session_lock = None
+                continue
+
+            # ── Step 4: Execute registration ──
+            try:
+                _emit("account_started", count + 1)
+                result = await process_single_registration(
+                    registration, network_strategy, previous_ip, used_ips,
+                    interaction_policy=interaction_policy,
+                    state_store=state_store,
+                    session_id=pair["session_id"],
+                    card_resource_provider=(
+                        None
+                        if run_scope == "account_provision"
+                        else acquire_card_for_checkout
+                    ),
+                    run_scope=run_scope,
+                    require_login_gate=(run_scope == "checkout_fulfillment"),
+                    checkout_goal=checkout_goal,
+                    signup_method=signup_method,
+                )
+            except SkipEmailException as skip:
+                logger.warning("registration skipped by operator: %s", skip)
+                result = AccountRunResult.for_code(
+                    email=pair["email"],
+                    code="SKIPPED",
+                    ip=_recover_ip_for_session(
+                        state_store,
+                        pair["session_id"],
+                    ),
+                )
+            except QuitBatchException as qb:
+                logger.warning("[QuitBatch] 操作员选择退出整个批次: %s", qb)
+                await network_strategy.finish_account()
+                active_session_lock.release()
+                active_session_lock = None
+                batch_end_reason = BatchEndReason.MANUAL_CANCELLED
+                break
+            except FATAL_EXCEPTIONS:
+                raise
+            except Exception as exc:
+                # A workflow defect must not escape the batch loop with a
+                # misleading ``completed`` summary.  Keep both resources
+                # reserved and require an operator to inspect the browser
+                # state before deciding whether the session can continue.
+                logger.error(
+                    "unexpected registration failure for %s: %s",
+                    mask_email(pair["email"]),
+                    type(exc).__name__,
+                )
+                current_session = state_store.get_session(pair["session_id"])
+                if current_session is not None:
+                    state_store.update_session(
+                        pair["session_id"],
+                        stage=current_session.stage,
+                        status="NEEDS_OPERATOR",
+                        last_error=f"UNEXPECTED:{type(exc).__name__}",
+                    )
+                result = _operator_result_for_exception(
+                    pair["email"],
+                    exc,
+                    ip=_recover_ip_for_session(
+                        state_store,
+                        pair["session_id"],
+                    ),
+                )
+
+           # ── Steps 5-7: Cleanup (disable proxy + kill Xray + iKuai redial) ──
+            await network_strategy.finish_account()
+
+            # ── 连续模式兜底转换 ──
+            # 工作流异常与旁路仍可能返回 NEEDS_OPERATOR（例如浏览器页面在
+            # 状态检测期间关闭、清理路径抛出的未预期错误）。连续执行模式把
+            # 普通阻塞统一转成 SKIPPED，由下面的归档路径移出 input 并恢复
+            # RELEASED；存在未确认的非幂等动作时转 UNKNOWN_SIDE_EFFECT，
+            # 隔离当前账户资源，批次继续处理下一个账户。
+            if (
+                run_scope in {"account_provision", "checkout_fulfillment"}
+                and interaction_mode == "continue_on_blocked"
+                and result.status is AccountStatus.NEEDS_OPERATOR
+            ):
+                ambiguous = state_store.has_unconfirmed_actions(
+                    pair["session_id"]
+                )
+                code = "UNKNOWN_SIDE_EFFECT" if ambiguous else "SKIPPED"
+                current_session = state_store.get_session(pair["session_id"])
+                if current_session is not None:
+                    state_store.update_session(
+                        pair["session_id"],
+                        stage=current_session.stage,
+                        status=code,
+                        last_error=current_session.last_error,
+                    )
+                # 连续模式重新分类：只改状态码，保留已采集的截图与失败原因。
+                result = result.reclassify(code)
+                logger.warning(
+                    "batch: %s blocked in continue mode → %s",
+                    mask_email(pair["email"]),
+                    code,
+                )
+
+           # A direct SKIPPED result may be produced by an interaction policy
+            # after a submit click.  Such an email must not reach the archive
+            # path below: a STARTED/UNKNOWN journal entry means the page may
+            # already have consumed the code.  This is normally exercised by
+            # EMAIL_CODE_SUBMIT, while remaining correct for any existing
+            # non-idempotent action journal entry.
+            if (
+                run_scope == "account_provision"
+                and result.raw_status == "SKIPPED"
+                and state_store.has_unconfirmed_actions(pair["session_id"])
+            ):
+                current_session = state_store.get_session(pair["session_id"])
+                if current_session is not None:
+                    state_store.update_session(
+                        pair["session_id"],
+                        stage=current_session.stage,
+                        status="UNKNOWN_SIDE_EFFECT",
+                        last_error=current_session.last_error,
+                    )
+                result = result.reclassify("UNKNOWN_SIDE_EFFECT")
+                logger.warning(
+                    "batch: %s skipped after an unconfirmed action → UNKNOWN_SIDE_EFFECT",
+                    mask_email(pair["email"]),
+                )
+
+            if (
+                run_scope == "account_provision"
+                and result.raw_status == "SKIPPED"
+            ):
+                # SKIPPED 归档统一走结果路径（account_flow 会把跳过转成
+                # SKIPPED 返回值，异常路径可能永远不触发）：先写 skipped、
+                # 再移出 input。失败不停止批次：转入 pending_archive，
+                # 批次结束统一 flush；flush 仍失败才转 SKIP_ARCHIVE_FAILED。
+                try:
+                    _archive_skipped_email(email_queue, pair["email"])
+                except Exception as exc:  # noqa: BLE001 — archive must not lose data
+                    logger.error(
+                        "skip archive failed for %s: %s — deferred to batch-end flush",
+                        mask_email(pair["email"]),
+                        type(exc).__name__,
+                    )
+                    try:
+                        raw_line = email_queue.find_raw_line(pair["email"])
+                    except Exception:  # noqa: BLE001 - best-effort pending record
+                        raw_line = None
+                    pending_archive.append(
+                        _PendingArchive(
+                            email=pair["email"],
+                            session_id=pair["session_id"],
+                            raw_line=raw_line,
+                        )
+                    )
+                    result = result.reclassify("SKIP_ARCHIVE_FAILED")
+
+            _finalize_resource_leases(
+                state_store,
+                pair["session_id"],
+                result,
+            )
+            _settle_session_status(
+                state_store,
+                pair["session_id"],
+                result,
+            )
+            _emit("account_completed", count + 1)
+            side_view = None
+            try:
+                from gpt_automation.security.credential_store import CredentialStore
+
+                side_view = handle_account_result_side_effects(
+                    state_store=state_store,
+                    credential_store=CredentialStore(config.CREDENTIAL_STORE_DIR),
+                    session_id=pair["session_id"],
+                    email=pair["email"],
+                    result=result,
+                    run_scope=run_scope,
+                    output_dir=config.OUTPUT_DIR,
+                    account_id=active_account_id,
+                )
+            except Exception as exc:
+                logger.error(
+                    "inventory side effects failed for %s: %s",
+                    mask_email(pair["email"]),
+                    type(exc).__name__,
+                )
+            if run_scope == "account_provision":
+                try:
+                    from gpt_automation.reporting.offer_report import (
+                        offer_item_from_result,
+                    )
+
+                    item = offer_item_from_result(pair["email"], result)
+                    if item is not None:
+                        offer_items.append(item)
+                except Exception as exc:  # noqa: BLE001 — report must not break the batch
+                    logger.warning(
+                        "offer report item failed for %s: %s",
+                        mask_email(pair["email"]),
+                        type(exc).__name__,
+                    )
+            if run_scope == "checkout_fulfillment":
+                try:
+                    from gpt_automation.reporting.checkout_offer_report import (
+                        checkout_offer_item_from_result,
+                    )
+
+                    item = checkout_offer_item_from_result(pair["email"], result)
+                    if item is not None:
+                        checkout_offer_items.append(item)
+                except Exception as exc:  # noqa: BLE001 — report must not break the batch
+                    logger.warning(
+                        "checkout offer report item failed for %s: %s",
+                        mask_email(pair["email"]),
+                        type(exc).__name__,
+                    )
+            if run_scope == "checkout_fulfillment" and card_tracker is not None:
+                try:
+                    from gpt_automation.reporting.checkout_card_report import (
+                        CardReportItem,
+                    )
+                    from gpt_automation.results.pending_file import PendingAccountsFile
+
+                    pending_cands = PendingAccountsFile(config.PENDING_FILE).list_candidates()
+                    pending_cand_map = {c.email: c for c in pending_cands}
+                    cand_entry = pending_cand_map.get(pair["email"])
+                    pending_line_no = cand_entry.line_no if cand_entry else 0
+
+                    evidence = getattr(result, "evidence_paths", ()) or ()
+                    shot_rel = evidence[0] if evidence else None
+                    shot_status = getattr(result, "screenshot_status", "missing") or ("captured" if shot_rel else "missing")
+
+                    card_leases = []
+                    with state_store._connection() as conn:
+                        rows = conn.execute(
+                            "SELECT resource_fingerprint, state, updated_at FROM resource_leases WHERE session_id = ? AND resource_type = 'card' ORDER BY updated_at ASC",
+                            (pair["session_id"],),
+                        ).fetchall()
+                        card_leases = [dict(r) for r in rows]
+
+                    payment_actions = state_store.list_actions_by_prefix(pair["session_id"], "PAYMENT_SUBMIT")
+                    rejected_payment_actions = [
+                        a for a in payment_actions
+                        if str(getattr(a.state, "value", a.state)) == "REJECTED"
+                    ]
+                    is_action_rejected = bool(rejected_payment_actions)
+
+                    for lease in card_leases:
+                        c_fp = lease["resource_fingerprint"]
+                        c_state = lease["state"]
+                        c_info = card_tracker.get_card_info(c_fp) or card_tracker.get_or_fallback_info(
+                            pair.get("card_no", ""),
+                            expiry=pair.get("card_expiry", ""),
+                            cvc=pair.get("card_cvc", ""),
+                        )
+
+                        decline_kind = ""
+                        decline_text = ""
+                        if c_state == "CONSUMED" or result.status is AccountStatus.SUCCESS:
+                            card_res = "passed"
+                            reason_desc = "会员开通成功"
+                            export_path = config.CARDS_PASSED_FILE
+                            passed_cards_file.append_card(
+                                c_info,
+                                email=pair["email"],
+                                pending_line_no=pending_line_no,
+                                batch_id=batch_report.batch_id,
+                                reason=reason_desc,
+                            )
+                        elif c_state == "QUARANTINED" and is_action_rejected:
+                            card_res = "declined"
+                            decline_kind = "generic_declined"
+                            reason_desc = "卡片被拒绝"
+                            decline_text = "カードが拒否されました。"
+                            if rejected_payment_actions:
+                                target_action = rejected_payment_actions[-1]
+                                if target_action.details:
+                                    try:
+                                        import json
+                                        data = json.loads(target_action.details)
+                                        if isinstance(data, dict):
+                                            decline_kind = data.get("kind", decline_kind)
+                                            reason_desc = data.get("label", reason_desc)
+                                            decline_text = data.get("text", decline_text)
+                                    except Exception:
+                                        pass
+                            export_path = config.CARDS_DECLINED_FILE
+                            declined_cards_file.append_card(
+                                c_info,
+                                email=pair["email"],
+                                pending_line_no=pending_line_no,
+                                batch_id=batch_report.batch_id,
+                                reason=reason_desc,
+                                decline_kind=decline_kind,
+                                decline_text=decline_text,
+                            )
+                        elif c_state == "QUARANTINED":
+                            card_res = "unknown"
+                            reason_desc = result.reason or "支付状态未确认（已隔离）"
+                            export_path = "未导出"
+                        else:
+                            continue
+
+                        checkout_card_items.append(
+                            CardReportItem(
+                                email=pair["email"],
+                                result=card_res,
+                                card_no_masked=c_info.masked_card_no,
+                                card_source_line=c_info.line_no,
+                                upsider_account=c_info.account,
+                                group_name=c_info.group_name,
+                                card_name=c_info.card_name,
+                                export_file=export_path,
+                                ip=getattr(result, "ip", "") or "",
+                                stage_or_reason=reason_desc,
+                                decline_kind=decline_kind,
+                                decline_text=decline_text,
+                                screenshot_relpath=shot_rel,
+                                screenshot_status=shot_status,
+                                finished_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                            )
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "checkout card report item failed for %s: %s",
+                        mask_email(pair["email"]),
+                        type(exc).__name__,
+                    )
+            if (
+                run_scope == "account_provision"
+                and result.raw_status == "ACCOUNT_READY"
+                and side_view is not None
+            ):
+                # Success: the account is promoted and pending is written;
+                # the email must now leave the active queue.  A cleanup
+                # failure never revokes the account (CONSUMED prevents reuse).
+                try:
+                    from gpt_automation.security.credential_store import CredentialStore
+
+                    credential = CredentialStore(
+                        config.CREDENTIAL_STORE_DIR
+                    ).load(pair["session_id"])
+                    if credential is not None and credential.complete:
+                        email_queue.remove_from_input(pair["email"])
+                        email_queue.remove_from_skipped(pair["email"])
+                        logger.info(
+                            "batch: %s success; email removed from input queue",
+                            mask_email(pair["email"]),
+                        )
+                    else:
+                        logger.error(
+                            "batch: %s credential incomplete; input line kept",
+                            mask_email(pair["email"]),
+                        )
+                except Exception as exc:  # noqa: BLE001 — cleanup is best-effort
+                    logger.error(
+                        "INPUT_QUEUE_CLEANUP_FAILED for %s: %s",
+                        mask_email(pair["email"]),
+                        type(exc).__name__,
+                    )
+            active_session_lock.release()
+            active_session_lock = None
+
+            if result.raw_status == "IP_NOT_ROTATED":
+                # Do not ask for a switch after the guard itself failed: no
+                # account was safely started, so there is no valid next state.
+                logger.error("batch abort: IP rotation failed")
+                logger.error("  used IPs: %s", used_ips)
+                logger.error("  current IP: %s", result.ip)
+                batch_end_reason = (
+                    BatchEndReason.INITIAL_IP_FAILED
+                    if count == 1
+                    else BatchEndReason.BETWEEN_ACCOUNT_IP_FAILED
+                )
+                break
+
+            # The IP returned by the browser guard is the IP actually used by
+            # this account.  Every account that really launched a browser -
+            # success, SKIPPED, business-rejected or suspended - defines the
+            # next account's IP comparison baseline, so an account that just
+            # used IP X can never be followed by another account on IP X in
+            # continuous mode.  Only IP_NOT_ROTATED (no browser ever started)
+            # must not update the baseline.
+            if result.raw_status != "IP_NOT_ROTATED" and result.ip:
+                previous_ip = result.ip
+
+            if result.succeeded or result.status in {
+                AccountStatus.ACCOUNT_READY,
+                AccountStatus.VERIFICATION_COMPLETE,
+            }:
+                success_count += 1
+                logger.info(
+                    "batch: %s succeeded; last_account_ip=%s",
+                    mask_email(result.email), previous_ip,
+                )
+            else:
+                fail_count += 1
+                logger.info(
+                    "batch: %s → %s",
+                    mask_email(result.email),
+                    result.raw_status,
+                )
+            report_reason, _suggestion = reason_text_for(result)
+            session_record = state_store.get_session(pair["session_id"])
+            email_resource = state_store.get_resource_state(
+                "email", pair["email"]
+            )
+            effective_stage = result.stage or (
+                session_record.stage if session_record is not None else ""
+            )
+            is_held = False
+            held_disp = ""
+            if run_scope == "checkout_fulfillment" and result.status is not AccountStatus.SUCCESS:
+                from gpt_automation.results.held_file import HeldAccountsFile
+                try:
+                    is_held = HeldAccountsFile(config.HELD_FILE).contains(result.email)
+                    held_disp = "ISOLATE" if result.status is AccountStatus.UNKNOWN_SIDE_EFFECT else "REVIEW"
+                except Exception:
+                    pass
+            # Evidence paths are populated by the workflow for every result,
+            # while the checkout card-report branch also derives a local
+            # ``evidence`` variable.  Initialize it here so account
+            # provisioning and early business outcomes (for example
+            # ACCOUNT_ALREADY_EXISTS) can be reported safely.
+            evidence = getattr(result, "evidence_paths", ()) or ()
+            batch_report.add_entry(
+                BatchOutcomeEntry(
+                    email=result.email,
+                    session_id=pair["session_id"],
+                    category=classify_result(result, run_scope),
+                    status=result.raw_status,
+                    stage=effective_stage,
+                    stage_label=stage_label(effective_stage),
+                    reason_text=report_reason,
+                    retry_disposition=disposition_for(result),
+                    finished_at=datetime.now(timezone.utc).isoformat(
+                        timespec="seconds"
+                    ),
+                    last_error=(
+                        session_record.last_error
+                        if session_record is not None
+                        else ""
+                    ),
+                    resource_state=(
+                        email_resource.value
+                        if email_resource is not None
+                        else ""
+                    ),
+                    in_input=email_queue.has_in_input(pair["email"]),
+                    in_skipped=email_queue.has_in_skipped(pair["email"]),
+                    held_archived=is_held,
+                    held_disposition=held_disp,
+                    evidence_path=evidence[0] if evidence else "",
+                    page_url=getattr(result, "page_url", "") or "",
+                )
+            )
+
+            # Browser close circuit breaker: a leaked Firefox process (or a
+            # failed context teardown) must stop the batch after a few
+            # consecutive accounts instead of silently accumulating processes.
+            close_failed = False
+            if state_store is not None:
+                close_failed = any(
+                    record.step_id == "BROWSER_CLOSE"
+                    and record.outcome_code == "BROWSER_CLOSE_FAILED"
+                    for record in state_store.list_step_records(
+                        pair["session_id"]
+                    )
+                )
+            if close_failed:
+                browser_close_failures += 1
+            else:
+                browser_close_failures = 0
+            if browser_close_failures >= MAX_BROWSER_CLOSE_FAILURES:
+                logger.error(
+                    "browser close failed for %d consecutive accounts; "
+                    "aborting batch to prevent process leaks",
+                    browser_close_failures,
+                )
+                batch_end_reason = BatchEndReason.BROWSER_CLOSE_FAILED
+                break
+
+            if _should_stop_after_account_result(result, interaction_mode):
+                batch_end_reason = BatchEndReason.OPERATOR_REQUIRED
+                break
+
+            if is_resume:
+                logger.info("人工恢复任务执行结束，停止批次以便操作员核对结果。")
+                break
+
+            # Check resources after each registration.  Only request a manual
+            # switch when another account can actually be acquired.
+            if run_scope == "checkout_fulfillment":
+                if count >= len(selected_account_ids):
+                    break
+                resource_report = input_mgr.get_resource_report()
+                if not resource_report_ready_for_scope(
+                    resource_report,
+                    run_scope,
+                    checkout_goal=checkout_goal,
+                ):
+                    logger.info(_resource_unavailable_message(resource_report))
+                    if batch_end_reason != BatchEndReason.OPERATOR_REQUIRED:
+                        batch_end_reason = _resource_gate_reason(resource_report)
+                    break
+            else:
+                resource_report = input_mgr.get_resource_report()
+                if not resource_report_ready_for_scope(
+                    resource_report,
+                    run_scope,
+                    checkout_goal=checkout_goal,
+                ):
+                    logger.info(_resource_unavailable_message(resource_report))
+                    if batch_end_reason != BatchEndReason.OPERATOR_REQUIRED:
+                        batch_end_reason = _resource_gate_reason(resource_report)
+                    break
+
+            if _should_wait_for_manual_ip_switch(
+                rotation_mode,
+                result.raw_status,
+                count,
+                max_accounts,
+                resources_available=True,
+            ):
+                switch_result = await network_strategy.prepare_next(previous_ip)
+                if switch_result is None or switch_result.status != "success":
+                    logger.error("manual IP switch failed after max retries, aborting batch")
+                    status = (
+                        switch_result.status
+                        if switch_result is not None
+                        else "failed"
+                    )
+                    batch_end_reason = (
+                        BatchEndReason.MANUAL_CANCELLED if status == "cancelled"
+                        else BatchEndReason.INPUT_UNAVAILABLE if status == "input_unavailable"
+                        else BatchEndReason.BETWEEN_ACCOUNT_IP_FAILED
+                    )
+                    break
+                logger.info(
+                    "manual IP switch confirmed for next account; candidate is not reserved: %s",
+                    switch_result.candidate_ip,
+                )
+    finally:
+        if active_session_lock is not None:
+            active_session_lock.release()
+            active_session_lock = None
+        # Always clean up proxy + xray on exit (including Ctrl+C interruptions)
+        try:
+            await network_strategy.finish_account()
+            logger.info("batch: cleanup completed on exit")
+        except Exception:
+            pass
+        await network_strategy.close()
+
+        # ── 批次收尾：统一 flush 延迟归档 ──
+        try:
+            flush_failures = _flush_pending_archive(
+                pending_archive,
+                email_queue,
+                state_store,
+            )
+            if pending_archive and not flush_failures:
+                for item in pending_archive:
+                    batch_report.update_entry(
+                        item.email,
+                        status="SKIPPED",
+                        category=BatchOutcomeCategory.AUTO_SKIPPED,
+                        reason_text="跳过归档失败，批次结束补写成功",
+                        retry_disposition=RetryDisposition.USER_DECIDES,
+                        in_skipped=True,
+                        in_input=False,
+                        resource_state="RELEASED",
+                    )
+                batch_report.add_batch_issue(
+                    f"延迟归档完成：{len(pending_archive)} 个跳过邮箱已补写 skipped 并移出 input"
+                )
+                if (
+                    batch_end_reason == BatchEndReason.OPERATOR_REQUIRED
+                    and batch_report.blocked_count == 0
+                ):
+                    batch_end_reason = BatchEndReason.COMPLETED
+            elif flush_failures:
+                batch_report.add_batch_issue(
+                    f"跳过归档失败 {len(flush_failures)} 个邮箱"
+                    "（仍保留在 input/email.txt，请关闭占用文件后重跑或人工处理）"
+                )
+                if batch_end_reason in {
+                    BatchEndReason.COMPLETED,
+                    BatchEndReason.RESOURCE_DEPLETED,
+                }:
+                    batch_end_reason = BatchEndReason.OPERATOR_REQUIRED
+        except Exception as exc:
+            logger.warning("skip archive flush crashed: %s", type(exc).__name__)
+
+        # ── 批次资源报告 ──
+        try:
+            resource_report = input_mgr.get_resource_report()
+            batch_report.finalize(batch_end_reason)
+            if batch_end_reason in {
+                BatchEndReason.INITIAL_IP_FAILED,
+                BatchEndReason.BETWEEN_ACCOUNT_IP_FAILED,
+            }:
+                batch_report.add_batch_issue(
+                    "IP 切换失败，批次已终止。"
+                )
+            print()
+            print("══════════════════════════════════════════")
+            from gpt_automation.reporting.batch_report import render_terminal_summary
+
+            print(
+                render_terminal_summary(
+                    batch_report,
+                    pending_file=config.PENDING_FILE,
+                    skipped_file=config.SKIPPED_FILE,
+                    results_file=config.OUTPUT_CSV,
+                    held_file=config.HELD_FILE,
+                    run_scope=run_scope,
+                )
+            )
+            print("══════════════════════════════════════════")
+            for line in _resource_summary_lines(resource_report):
+                print(line)
+            print("══════════════════════════════════════════")
+            try:
+                report_path = write_error_report(
+                    batch_report,
+                    config.BATCH_REPORT_DIR,
+                )
+                if report_path is not None:
+                    print(f"  错误报告: {os.path.abspath(report_path)}")
+                else:
+                    print("  错误报告: 未生成（本批次没有失败、跳过或批次级错误）")
+            except Exception as exc:
+                logger.error(
+                    "错误报告生成失败: %s",
+                    type(exc).__name__,
+                )
+                print("  错误报告: 生成失败（不影响账户状态）")
+            if run_scope == "account_provision":
+                try:
+                    from gpt_automation.reporting.offer_report import (
+                        write_offer_report,
+                    )
+                    from gpt_automation.phases.phase3 import (
+                        build_offer_eligibility_policy,
+                    )
+
+                    offer_path = write_offer_report(
+                        offer_items,
+                        config.OFFER_REPORT_DIR,
+                        batch_report.batch_id,
+                        pending_file=config.PENDING_FILE,
+                        target_promo_campaign=(
+                            build_offer_eligibility_policy().target_promo_campaign
+                        ),
+                    )
+                    if offer_path is not None:
+                        print(f"  Offer 报告: {os.path.abspath(offer_path)}")
+                    else:
+                        print("  Offer 报告: 未生成（批次号无效）")
+                except Exception as exc:
+                    logger.error(
+                        "Offer 报告生成失败: %s",
+                        type(exc).__name__,
+                    )
+                    print("  Offer 报告: 生成失败（不影响账户状态）")
+            if run_scope == "checkout_fulfillment":
+                try:
+                    from gpt_automation.reporting.checkout_offer_report import (
+                        write_checkout_offer_report,
+                    )
+
+                    checkout_offer_path = write_checkout_offer_report(
+                        checkout_offer_items,
+                        config.CHECKOUT_OFFER_REPORT_DIR,
+                        batch_report.batch_id,
+                        interaction_mode=batch_report.interaction_mode,
+                    )
+                    if checkout_offer_path is not None:
+                        print(f"  开通优惠报告: {os.path.abspath(checkout_offer_path)}")
+                    else:
+                        print("  开通优惠报告: 未生成（批次号无效）")
+                except Exception as exc:
+                    logger.error(
+                        "开通优惠报告生成失败: %s",
+                        type(exc).__name__,
+                    )
+                    print("  开通优惠报告: 生成失败（不影响账户状态）")
+                try:
+                    from gpt_automation.reporting.checkout_card_report import (
+                        write_checkout_card_report,
+                    )
+
+                    card_report_path = write_checkout_card_report(
+                        checkout_card_items,
+                        config.CHECKOUT_CARD_REPORT_DIR,
+                        batch_report.batch_id,
+                        passed_file=config.CARDS_PASSED_FILE,
+                        declined_file=config.CARDS_DECLINED_FILE,
+                        interaction_mode=batch_report.interaction_mode,
+                    )
+                    if card_report_path is not None:
+                        print(f"  通过的卡文件: {os.path.abspath(config.CARDS_PASSED_FILE)}")
+                        print(f"  被拒绝的卡文件: {os.path.abspath(config.CARDS_DECLINED_FILE)}")
+                        print(f"  开通卡报告: {card_report_path}")
+                    else:
+                        print("  开通卡报告: 未生成（批次号无效）")
+                except Exception as exc:
+                    logger.error(
+                        "开通卡报告生成失败: %s",
+                        type(exc).__name__,
+                    )
+                    print("  开通卡报告: 生成失败（不影响账户状态）")
+            print()
+        except Exception as exc:
+            logger.warning("资源报告生成失败: %s", exc)
+
+        # Play the completion chime only for normal completion reasons.
+        if batch_end_reason in (BatchEndReason.COMPLETED, BatchEndReason.RESOURCE_DEPLETED):
+            from gpt_automation.utils.beep import play_completion_sound
+            play_completion_sound()
+
+    logger.info("batch done. reason=%s, last_ip=%s, used=%d", batch_end_reason, previous_ip, len(used_ips))
+    return _batch_exit_code(batch_end_reason)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(asyncio.run(main(runtime_options=runtime_options_from_env(os.environ))))
+    except KeyboardInterrupt:
+        logger.warning("interrupted by user")
+        sys.exit(130)

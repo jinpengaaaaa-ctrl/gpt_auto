@@ -1,0 +1,57 @@
+"""Persistent workflow checkpoints, action journal, and resource leases."""
+
+from gpt_automation.state.store import (
+    ActionRecord,
+    ActionState,
+    EvidenceRecord,
+    FinalizationRecord,
+    FinalizationStatus,
+    ResourceConflictError,
+    ResourceState,
+    RegisteredAccountRecord,
+    SessionRecord,
+    SessionOverview,
+    StepRecord,
+    StepEventRecord,
+    StateStore,
+    StateTransitionError,
+    UnsafeActionReplayError,
+)
+from gpt_automation.state.recovery import (
+    ProfileState,
+    RecoveryCapability,
+    SessionCandidate,
+    SessionCatalog,
+    UnmappedProfile,
+    inspect_profile_state,
+    render_session_candidate,
+    resolve_email_for_fingerprint,
+)
+from gpt_automation.state.execution_lock import SessionExecutionLock
+
+__all__ = [
+    "ActionRecord",
+    "ActionState",
+    "EvidenceRecord",
+    "FinalizationRecord",
+    "FinalizationStatus",
+    "ResourceConflictError",
+    "ResourceState",
+    "RegisteredAccountRecord",
+    "SessionRecord",
+    "SessionOverview",
+    "StepRecord",
+    "StepEventRecord",
+    "StateStore",
+    "StateTransitionError",
+    "UnsafeActionReplayError",
+    "ProfileState",
+    "RecoveryCapability",
+    "SessionCandidate",
+    "SessionCatalog",
+    "UnmappedProfile",
+    "inspect_profile_state",
+    "render_session_candidate",
+    "resolve_email_for_fingerprint",
+    "SessionExecutionLock",
+]

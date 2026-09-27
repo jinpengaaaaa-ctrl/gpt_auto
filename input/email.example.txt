@@ -1,0 +1,5 @@
+# One account per line:
+# email----email_password----client_id----refresh_token
+#
+# Replace these placeholders with your own mailbox credentials before running.
+account@example.com----replace-with-email-password----replace-with-client-id----replace-with-refresh-token

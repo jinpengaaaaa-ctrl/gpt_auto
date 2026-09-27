@@ -1,0 +1,47 @@
+# Local secrets and environment configuration
+.env
+!.env.example
+
+# User-provided account, payment, address, and OAuth data
+input/*
+!input/cards.example.csv
+!input/email.example.txt
+
+# Runtime state and generated outputs
+runtime/*
+accounts/*
+profiles/*
+evidence/*
+TMP/*
+logs/*
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+# Local Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE and OS files
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Generated frontend/build artifacts
+frontend/node_modules/
+frontend/dist/
+dist/
+build/
+*.egg-info/
+
+# Temporary browser/download files
+*.crdownload
+*.tmp
