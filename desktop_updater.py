@@ -10,7 +10,11 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-REPOSITORY = "jinpengaaaaa-ctrl/gpt_auto"
+# Keep the active repository first.  The second entry lets a build that was
+# released during the account migration continue to find releases if the old
+# repository becomes reachable again.
+REPOSITORIES = ("jinpengaaaaa-ctrl/gpt_auto", "jpwcreate/gpt_auto")
+REPOSITORY = REPOSITORIES[0]
 API_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
 VERSION_FILE = Path(__file__).resolve().with_name("VERSION")
 
@@ -31,36 +35,45 @@ def _version_tuple(value: str) -> tuple[int, ...]:
 
 
 def latest_release(timeout: float = 5.0) -> dict[str, Any] | None:
-    request = urllib.request.Request(
-        API_URL,
-        headers={"Accept": "application/vnd.github+json", "User-Agent": "GPT-Automation-Desktop"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except Exception:
-        return None
-    tag = str(payload.get("tag_name", ""))
-    if not tag or _version_tuple(tag) <= _version_tuple(current_version()):
-        return None
-    assets = payload.get("assets") or []
-    installer = next(
-        (
-            asset
-            for asset in assets
-            if str(asset.get("name", "")).lower().endswith((".exe", ".msi"))
-        ),
-        None,
-    )
-    if not installer:
-        return None
-    return {
-        "version": tag.lstrip("v"),
-        "name": payload.get("name") or tag,
-        "body": payload.get("body") or "",
-        "asset_name": installer.get("name", ""),
-        "asset_url": installer.get("browser_download_url", ""),
-    }
+    for repository in REPOSITORIES:
+        api_url = f"https://api.github.com/repos/{repository}/releases/latest"
+        request = urllib.request.Request(
+            api_url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "GPT-Automation-Desktop",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception:
+            # A repository can be unavailable during an account transfer.
+            # Continue to the next known source before declaring no update.
+            continue
+        tag = str(payload.get("tag_name", ""))
+        if not tag or _version_tuple(tag) <= _version_tuple(current_version()):
+            continue
+        assets = payload.get("assets") or []
+        installer = next(
+            (
+                asset
+                for asset in assets
+                if str(asset.get("name", "")).lower().endswith((".exe", ".msi"))
+            ),
+            None,
+        )
+        if not installer:
+            continue
+        return {
+            "version": tag.lstrip("v"),
+            "name": payload.get("name") or tag,
+            "body": payload.get("body") or "",
+            "asset_name": installer.get("name", ""),
+            "asset_url": installer.get("browser_download_url", ""),
+            "repository": repository,
+        }
+    return None
 
 
 def install_release(release: dict[str, Any], *, silent: bool = False) -> Path:

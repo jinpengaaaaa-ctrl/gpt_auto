@@ -44,6 +44,13 @@ def _copy_seed_files() -> None:
         env_path.write_text(seed.read_text(encoding="utf-8"), encoding="utf-8")
 
 
+def _app_version() -> str:
+    try:
+        return (RESOURCE_ROOT / "VERSION").read_text(encoding="utf-8").strip().lstrip("v")
+    except OSError:
+        return "未知版本"
+
+
 class ApiClient:
     def __init__(self, base: str) -> None:
         self.base = base.rstrip("/")
@@ -76,7 +83,7 @@ class DashboardApp(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("GPT Automation · 桌面控制台")
+        self.title(f"GPT Automation · 桌面控制台 v{_app_version()}")
         try:
             self.iconbitmap(str(RESOURCE_ROOT / "assets" / "app_icon.ico"))
         except tk.TclError:
