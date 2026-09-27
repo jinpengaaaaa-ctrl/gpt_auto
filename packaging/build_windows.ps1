@@ -17,9 +17,11 @@ if (Test-Path 'dist\GPTAutomation') { Remove-Item -Recurse -Force 'dist\GPTAutom
   --onedir `
   --windowed `
   --name GPTAutomation `
+  --icon 'assets\app_icon.ico' `
   --add-data 'frontend\dist;frontend\dist' `
   --add-data '.env.example;.' `
   --add-data 'VERSION;.' `
+  --add-data 'assets\app_icon.ico;assets' `
   --collect-all cloakbrowser `
   desktop_app.py
 

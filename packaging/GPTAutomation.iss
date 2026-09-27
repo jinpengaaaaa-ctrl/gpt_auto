@@ -1,5 +1,5 @@
 #define MyAppName "GPT Automation"
-#define MyAppPublisher "jpwcreate"
+#define MyAppPublisher "jinpengaaaaa-ctrl"
 #define MyAppExeName "GPTAutomation.exe"
 #ifndef MyAppVersion
   #define MyAppVersion "0.0.0"
@@ -19,6 +19,7 @@ SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=lowest
 ArchitecturesInstallIn64BitMode=x64
+SetupIconFile=..\assets\app_icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 
 [Files]

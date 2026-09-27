@@ -77,6 +77,10 @@ class DashboardApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("GPT Automation · 桌面控制台")
+        try:
+            self.iconbitmap(str(RESOURCE_ROOT / "assets" / "app_icon.ico"))
+        except tk.TclError:
+            pass
         self.geometry("1220x780")
         self.minsize(980, 640)
         self.configure(bg="#f7f8f5")

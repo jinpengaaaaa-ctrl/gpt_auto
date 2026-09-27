@@ -10,7 +10,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-REPOSITORY = "jpwcreate/gpt_auto"
+REPOSITORY = "jinpengaaaaa-ctrl/gpt_auto"
 API_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
 VERSION_FILE = Path(__file__).resolve().with_name("VERSION")
 
